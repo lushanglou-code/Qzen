@@ -6,9 +6,30 @@ Qzen 主窗口模块。
 主窗口负责接收用户输入，调用业务逻辑层的功能，并展示处理结果。
 """
 
-from PyQt6.QtWidgets import QMainWindow, QMessageBox, QWidget
+from PyQt6.QtWidgets import (
+    QMainWindow,
+    QMessageBox,
+    QWidget,
+    QVBoxLayout,
+    QGridLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QFileDialog,
+    QProgressBar,
+)
 from PyQt6.QtGui import QAction
 import logging
+
+# 定义本项目支持的文档文件类型
+SUPPORTED_EXTENSIONS = {
+    # 文本文档
+    '.txt', '.md',
+    # PDF 文档
+    '.pdf',
+    # Office 文档
+    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
+}
 
 
 class MainWindow(QMainWindow):
@@ -24,6 +45,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Qzen (千针) - 本地文档智能整理")
         self.setGeometry(100, 100, 800, 600)
 
+        self._create_central_widget()
         self._create_menus()
 
     def _create_menus(self) -> None:
@@ -35,6 +57,103 @@ class MainWindow(QMainWindow):
         db_config_action = QAction("数据库配置(&D)...", self)
         db_config_action.triggered.connect(self.show_db_config_dialog)
         file_menu.addAction(db_config_action)
+
+    def _create_central_widget(self) -> None:
+        """创建主窗口的中心控件布局。"""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+
+        # --- 路径配置区 ---
+        path_layout = QGridLayout()
+        self.source_dir_input = QLineEdit()
+        self.source_dir_button = QPushButton("选择...")
+        self.source_dir_button.clicked.connect(
+            lambda: self._select_directory(self.source_dir_input, "选择源文件夹")
+        )
+
+        self.intermediate_dir_input = QLineEdit()
+        self.intermediate_dir_button = QPushButton("选择...")
+        self.intermediate_dir_button.clicked.connect(
+            lambda: self._select_directory(self.intermediate_dir_input, "选择中间文件夹")
+        )
+
+        path_layout.addWidget(QLabel("源文件夹:"), 0, 0)
+        path_layout.addWidget(self.source_dir_input, 0, 1)
+        path_layout.addWidget(self.source_dir_button, 0, 2)
+        path_layout.addWidget(QLabel("中间文件夹:"), 1, 0)
+        path_layout.addWidget(self.intermediate_dir_input, 1, 1)
+        path_layout.addWidget(self.intermediate_dir_button, 1, 2)
+
+        main_layout.addLayout(path_layout)
+
+        # --- 操作按钮和进度条 ---
+        self.deduplicate_button = QPushButton("开始去重")
+        self.deduplicate_button.clicked.connect(self.start_deduplication)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False) # 默认隐藏
+
+        main_layout.addWidget(self.deduplicate_button)
+        main_layout.addWidget(self.progress_bar)
+        main_layout.addStretch() # 添加伸缩因子，让控件靠上
+
+    def _select_directory(self, line_edit: QLineEdit, caption: str) -> None:
+        """打开文件夹选择对话框并更新输入框。"""
+        directory = QFileDialog.getExistingDirectory(self, caption)
+        if directory:
+            line_edit.setText(directory)
+
+    def start_deduplication(self) -> None:
+        """开始执行去重流程的入口方法。"""
+        source_dir = self.source_dir_input.text()
+        intermediate_dir = self.intermediate_dir_input.text()
+
+        # --- 输入验证 ---
+        if not self.db_handler:
+            QMessageBox.warning(self, "警告", "请先配置并成功连接数据库！")
+            return
+        if not source_dir or not intermediate_dir:
+            QMessageBox.warning(self, "警告", "请选择源文件夹和中间文件夹！")
+            return
+
+        # --- 准备并启动后台任务 ---
+        from qzen_core.orchestrator import Orchestrator
+        from qzen_ui.worker import Worker
+
+        self.deduplicate_button.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+
+        orchestrator = Orchestrator(self.db_handler)
+        self.worker = Worker(
+            orchestrator.run_deduplication,
+            source_path=source_dir,
+            intermediate_path=intermediate_dir,
+            allowed_extensions=SUPPORTED_EXTENSIONS,
+            progress_callback=self.update_progress
+        )
+        self.worker.result_ready.connect(self.on_task_finished)
+        self.worker.error_occurred.connect(self.on_task_error)
+        self.worker.start()
+
+    def update_progress(self, current_value: int, max_value: int, status_text: str) -> None:
+        """更新进度条和状态的回调函数。"""
+        self.progress_bar.setMaximum(max_value)
+        self.progress_bar.setValue(current_value)
+        self.setWindowTitle(f"Qzen (千针) - {status_text}")
+
+    def on_task_finished(self) -> None:
+        """处理任务正常完成的回调。"""
+        self.deduplicate_button.setEnabled(True)
+        self.setWindowTitle("Qzen (千针) - 本地文档智能整理")
+        QMessageBox.information(self, "完成", "去重任务已成功完成！")
+
+    def on_task_error(self, error: Exception) -> None:
+        """处理任务发生异常的回调。"""
+        logging.error(f"去重任务线程发生异常: {error}", exc_info=True)
+        self.deduplicate_button.setEnabled(True)
+        self.setWindowTitle("Qzen (千针) - 本地文档智能整理")
+        QMessageBox.critical(self, "错误", f"任务执行失败！\n错误信息: {error}")
 
     def show_db_config_dialog(self) -> None:
         """显示数据库配置对话框并处理结果。"""
