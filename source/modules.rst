@@ -42,4 +42,5 @@
    :caption: 通用工具包 (Utils)
    :toctree: generated
 
+   qzen_utils.config_manager
    qzen_utils.logger_config

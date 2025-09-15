@@ -5,7 +5,7 @@
 使用 SQLAlchemy 的声明式基类来定义与数据库表映射的Python类。
 """
 
-from sqlalchemy import String, LargeBinary
+from sqlalchemy import String, Text # 引入 Text 类型
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -26,5 +26,5 @@ class Document(Base):
     file_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     # 文件在中间目录的绝对路径
     file_path: Mapped[str] = mapped_column(String(1024), nullable=False, unique=True)
-    # 存储TF-IDF计算出的特征向量，使用二进制格式
-    feature_vector: Mapped[bytes] = mapped_column(LargeBinary, nullable=True)
+    # 存储TF-IDF计算出的特征向量，使用JSON文本格式以保证健壮性
+    feature_vector: Mapped[str] = mapped_column(Text, nullable=True)
