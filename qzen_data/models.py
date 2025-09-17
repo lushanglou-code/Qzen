@@ -6,8 +6,9 @@
 映射的 Python 类。每个类代表一个数据表，类的属性则映射到表的列。
 """
 
-from sqlalchemy import String, Text
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+import datetime
+from sqlalchemy import String, Text, ForeignKey, DateTime
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
@@ -47,3 +48,51 @@ class Document(Base):
     # 存储 TF-IDF 计算出的特征向量，使用 JSON 文本格式以保证跨数据库的健壮性。
     # 此字段可以为空，因为向量化是一个独立步骤。
     feature_vector: Mapped[str] = mapped_column(Text, nullable=True)
+
+# --- 新增：任务运行与结果持久化模型 ---
+
+class TaskRun(Base):
+    """
+    映射到 `task_runs` 表，记录每一次操作任务的运行信息。
+
+    Attributes:
+        id (int): 自增主键，作为任务的唯一标识。
+        task_type (str): 任务的类型，如 'deduplication', 'rename', 'search'。
+        start_time (datetime): 任务开始执行的时间。
+        summary (str): 任务完成后的摘要信息，例如处理的文件总数。
+    """
+    __tablename__ = "task_runs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    start_time: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
+    summary: Mapped[str] = mapped_column(Text, nullable=True)
+
+class DeduplicationResult(Base):
+    """
+    映射到 `deduplication_results` 表，存储去重操作的结果。
+    """
+    __tablename__ = "deduplication_results"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_run_id: Mapped[int] = mapped_column(ForeignKey("task_runs.id"))
+    duplicate_file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    original_file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+class RenameResult(Base):
+    """
+    映射到 `rename_results` 表，存储聚类重命名操作的结果。
+    """
+    __tablename__ = "rename_results"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_run_id: Mapped[int] = mapped_column(ForeignKey("task_runs.id"))
+    original_file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    new_file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+
+class SearchResult(Base):
+    """
+    映射到 `search_results` 表，存储关键词搜索操作的结果。
+    """
+    __tablename__ = "search_results"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_run_id: Mapped[int] = mapped_column(ForeignKey("task_runs.id"))
+    keyword: Mapped[str] = mapped_column(String(255), nullable=False)
+    matched_file_path: Mapped[str] = mapped_column(String(1024), nullable=False)

@@ -7,6 +7,7 @@
 以及所有数据模型（CURD）的增删改查操作。
 """
 
+import datetime
 from contextlib import contextmanager
 import logging
 from typing import Generator, List, Optional
@@ -15,7 +16,7 @@ from sqlalchemy import create_engine, NullPool, Text
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.engine import Engine
 
-from .models import Document, Base
+from .models import Base, Document, TaskRun, DeduplicationResult, RenameResult, SearchResult
 
 
 class DatabaseHandler:
@@ -159,7 +160,6 @@ class DatabaseHandler:
             documents: 一个 `Document` 对象的列表，这些对象将被添加到数据库中。
         """
         with self.get_session() as session:
-            # 使用 session.begin() 来确保整个批量操作在一个事务中完成
             with session.begin():
                 session.bulk_save_objects(documents)
             session.commit()
@@ -168,9 +168,6 @@ class DatabaseHandler:
         """
         使用 `merge` 批量更新已存在的文档记录。
 
-        `session.merge()` 会根据主键检查记录是否存在。如果存在，则更新；
-        如果不存在，则插入。这对于需要同时处理新旧数据的场景很有用。
-
         Args:
             documents: 一个 `Document` 对象的列表，这些对象将被合并到数据库中。
         """
@@ -178,4 +175,58 @@ class DatabaseHandler:
             with session.begin():
                 for doc in documents:
                     session.merge(doc)
+            session.commit()
+
+    # --- 新增：任务与结果持久化方法 ---
+
+    def create_task_run(self, task_type: str) -> TaskRun:
+        """
+        创建一个新的任务运行记录。
+
+        Args:
+            task_type: 任务的类型字符串，例如 'deduplication'。
+
+        Returns:
+            新创建并已提交到数据库的 TaskRun 对象，包含其ID。
+        """
+        new_task = TaskRun(task_type=task_type, start_time=datetime.datetime.utcnow())
+        with self.get_session() as session:
+            session.add(new_task)
+            session.commit()
+            session.refresh(new_task) # 刷新对象以获取数据库生成的ID
+        return new_task
+
+    def update_task_summary(self, task_run_id: int, summary: str) -> None:
+        """
+        更新指定任务运行记录的摘要信息。
+
+        Args:
+            task_run_id: 目标任务运行记录的ID。
+            summary: 要设置的摘要文本。
+        """
+        with self.get_session() as session:
+            task_run = session.get(TaskRun, task_run_id)
+            if task_run:
+                task_run.summary = summary
+                session.commit()
+
+    def bulk_insert_deduplication_results(self, results: List[DeduplicationResult]) -> None:
+        """批量插入去重结果记录。"""
+        with self.get_session() as session:
+            with session.begin():
+                session.bulk_save_objects(results)
+            session.commit()
+
+    def bulk_insert_rename_results(self, results: List[RenameResult]) -> None:
+        """批量插入重命名结果记录。"""
+        with self.get_session() as session:
+            with session.begin():
+                session.bulk_save_objects(results)
+            session.commit()
+
+    def bulk_insert_search_results(self, results: List[SearchResult]) -> None:
+        """批量插入搜索结果记录。"""
+        with self.get_session() as session:
+            with session.begin():
+                session.bulk_save_objects(results)
             session.commit()
