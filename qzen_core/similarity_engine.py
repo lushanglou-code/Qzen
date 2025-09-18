@@ -3,7 +3,7 @@
 相似度计算引擎模块。
 
 封装了文档的特征提取（TF-IDF）、相似度计算（余弦相似度）以及
-高效的近邻搜索算法。
+高效的近邻搜索算法。该引擎经过特别配置，以支持高效的中文文本处理。
 """
 
 import logging
@@ -21,14 +21,16 @@ class SimilarityEngine:
     """
     封装了文档相似度计算和搜索的核心功能。
 
-    该引擎的核心是 scikit-learn 的 `TfidfVectorizer`，它能将原始
-    文本文档集合转换为一个 TF-IDF 特征矩阵，为后续的量化比较奠定基础。
+    该引擎的核心是 scikit-learn 的 `TfidfVectorizer`。通过为其提供一个
+    集成了 `jieba` 分词的自定义 `tokenizer`，该引擎能够将原始的中文
+    文本文档集合，高效地转换为一个可用于量化比较的 TF-IDF 特征矩阵。
 
     Attributes:
-        vectorizer (TfidfVectorizer): scikit-learn 的 TF-IDF 向量化器实例。
+        vectorizer (TfidfVectorizer): 一个为处理中文而特别配置的 scikit-learn
+                                  TF-IDF 向量化器实例。
         feature_matrix (csr_matrix | None): 由 `vectorize_documents` 方法生成的
                                           文档-词项稀疏矩阵。在向量化之前为 None。
-        stopwords (set[str]): 从外部文件加载的停用词集合。
+        stopwords (set[str]): 从外部文件加载的中文停用词集合。
     """
 
     def __init__(self, max_features: int = 5000, stopwords_path: str = "stopwords.txt"):
@@ -101,7 +103,7 @@ class SimilarityEngine:
         然后将每个文档转换为一个数值型特征向量。
 
         Args:
-            documents: 一个包含原始文档内容的字符串列表。
+            documents: 一个包含经 `file_handler` 清洗和切片后的文本字符串列表。
 
         Returns:
             一个 CSR 格式的稀疏矩阵，其中每行代表一个文档的TF-IDF特征向量。

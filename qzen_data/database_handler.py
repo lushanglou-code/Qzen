@@ -10,7 +10,7 @@
 import datetime
 from contextlib import contextmanager
 import logging
-from typing import Generator, List, Optional
+from typing import Generator, List, Optional, TypeVar, Iterable
 
 from sqlalchemy import create_engine, NullPool, StaticPool, Text
 from sqlalchemy.orm import sessionmaker, Session
@@ -18,6 +18,20 @@ from sqlalchemy.engine import Engine
 
 from .models import Base, Document, TaskRun, DeduplicationResult, RenameResult, SearchResult
 
+# --- 用于分批处理的辅助功能 ---
+T = TypeVar('T')
+DEFAULT_BATCH_SIZE = 500  # 定义一个默认的批处理大小
+
+def _batch_iterator(iterable: Iterable[T], size: int) -> Generator[List[T], None, None]:
+    """将一个可迭代对象切分为多个固定大小的批次。"""
+    batch = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 class DatabaseHandler:
     """
@@ -49,30 +63,32 @@ class DatabaseHandler:
         self._session_local: Optional[sessionmaker[Session]] = None
 
     def _get_engine(self) -> Engine:
-        """获取或创建 SQLAlchemy Engine 实例（懒加载）。"""
+        """
+        获取或创建 SQLAlchemy Engine 实例（懒加载）。
+
+        此方法为 DM8 等真实数据库强制指定了 UTF-8 编码，以从根本上
+        避免 UnicodeEncodeError。
+        """
         if self._engine is None:
-            pool_opts = {}
+            engine_opts = {}
             connect_args = {}
 
-            # 为内存数据库（用于测试）和真实数据库（如DM8）配置不同的连接池和参数
-            if self._db_url == "sqlite:///:memory:":
+            if self._db_url.startswith("sqlite:///"):
                 # 对于内存SQLite，必须在所有操作中使用同一个连接，否则表会丢失。
-                # StaticPool 确保了这一点。
-                pool_opts['poolclass'] = StaticPool
-                # check_same_thread=False 是SQLite在多线程测试环境下的要求
+                engine_opts['poolclass'] = StaticPool
                 connect_args['check_same_thread'] = False
             else:
-                # 对于真实的、基于网络的数据库，使用NullPool更简单健壮，
-                # 避免了处理闲置连接被服务器关闭的问题。
-                pool_opts['poolclass'] = NullPool
-                # 仅对网络数据库设置连接超时
+                # 对于真实的、基于网络的数据库，使用NullPool更简单健壮。
+                engine_opts['poolclass'] = NullPool
+                # --- 关键修复: 根据 dmPython 文档，强制使用 UTF-8 编码 ---
+                connect_args['local_code'] = 1  # 1 代表 UTF-8
                 connect_args['connection_timeout'] = 15
 
             self._engine = create_engine(
                 self._db_url,
                 echo=self._echo,
                 connect_args=connect_args,
-                **pool_opts
+                **engine_opts
             )
         return self._engine
 
@@ -104,20 +120,15 @@ class DatabaseHandler:
         try:
             yield session
         except Exception:
-            # 如果在会话的生命周期内发生任何异常，回滚所有未提交的更改
             logging.error("数据库会话发生异常，正在回滚事务。", exc_info=True)
             session.rollback()
             raise
         finally:
-            # 无论成功与否，最终都要关闭会话，将连接交还给连接池
             session.close()
 
     def recreate_tables(self) -> None:
         """
         清空并重新创建所有在 Base.metadata 中定义的表。
-
-        这是一个具有高度破坏性的操作，主要用于测试或全新的开始。
-        它会删除所有现有数据。
         """
         engine = self._get_engine()
         logging.info("正在删除所有旧表...")
@@ -128,11 +139,6 @@ class DatabaseHandler:
     def test_connection(self) -> bool:
         """
         测试与数据库的连接是否成功。
-
-        尝试建立一个连接，如果成功则立即关闭并返回 True。
-
-        Returns:
-            如果连接成功，返回 True，否则返回 False。
         """
         try:
             engine = self._get_engine()
@@ -145,9 +151,6 @@ class DatabaseHandler:
     def get_all_documents(self) -> List[Document]:
         """
         从数据库中获取所有的 `Document` 记录。
-
-        Returns:
-            一个包含所有 `Document` 对象的列表。
         """
         with self.get_session() as session:
             return session.query(Document).all()
@@ -155,63 +158,54 @@ class DatabaseHandler:
     def get_documents_without_vectors(self) -> List[Document]:
         """
         获取所有尚未计算特征向量的 `Document` 记录。
-
-        Returns:
-            一个 `Document` 对象列表，其中每个对象的 `feature_vector` 字段为 None。
         """
         with self.get_session() as session:
             return session.query(Document).filter(Document.feature_vector.is_(None)).all()
 
-    def bulk_insert_documents(self, documents: List[Document]) -> None:
+    def bulk_insert_documents(self, documents: List[Document], batch_size: int = DEFAULT_BATCH_SIZE) -> None:
         """
-        使用 `bulk_save_objects` 高效地批量插入新文档记录。
+        以分批的方式，高效地批量插入新文档记录，以支持大规模数据处理。
 
         Args:
-            documents: 一个 `Document` 对象的列表，这些对象将被添加到数据库中。
+            documents: 一个 `Document` 对象的列表。
+            batch_size: 每个批次插入的记录数。
         """
         with self.get_session() as session:
-            session.bulk_save_objects(documents)
-            session.commit()
+            for batch in _batch_iterator(documents, batch_size):
+                session.bulk_save_objects(batch)
+                session.commit()
+            logging.info(f"成功分批插入 {len(documents)} 条文档记录。")
 
-    def bulk_update_documents(self, documents: List[Document]) -> None:
+    def bulk_update_documents(self, documents: List[Document], batch_size: int = DEFAULT_BATCH_SIZE) -> None:
         """
-        使用 `merge` 批量更新已存在的文档记录。
+        以分批的方式，批量更新已存在的文档记录。
 
         Args:
-            documents: 一个 `Document` 对象的列表，这些对象将被合并到数据库中。
+            documents: 一个 `Document` 对象的列表。
+            batch_size: 每个批次更新的记录数。
         """
         with self.get_session() as session:
-            with session.begin():
-                for doc in documents:
-                    session.merge(doc)
-            session.commit()
-
-    # --- 新增：任务与结果持久化方法 ---
+            for batch in _batch_iterator(documents, batch_size):
+                with session.begin():
+                    for doc in batch:
+                        session.merge(doc)
+                session.commit()
+            logging.info(f"成功分批更新 {len(documents)} 条文档记录。")
 
     def create_task_run(self, task_type: str) -> TaskRun:
         """
         创建一个新的任务运行记录。
-
-        Args:
-            task_type: 任务的类型字符串，例如 'deduplication'。
-
-        Returns:
-            新创建并已提交到数据库的 TaskRun 对象，包含其ID。
         """
         new_task = TaskRun(task_type=task_type, start_time=datetime.datetime.utcnow())
         with self.get_session() as session:
             session.add(new_task)
             session.commit()
-            session.refresh(new_task) # 刷新对象以获取数据库生成的ID
+            session.refresh(new_task)
         return new_task
 
     def update_task_summary(self, task_run_id: int, summary: str) -> None:
         """
         更新指定任务运行记录的摘要信息。
-
-        Args:
-            task_run_id: 目标任务运行记录的ID。
-            summary: 要设置的摘要文本。
         """
         with self.get_session() as session:
             task_run = session.get(TaskRun, task_run_id)
@@ -219,24 +213,26 @@ class DatabaseHandler:
                 task_run.summary = summary
                 session.commit()
 
-    def bulk_insert_deduplication_results(self, results: List[DeduplicationResult]) -> None:
-        """批量插入去重结果记录。"""
+    def bulk_insert_deduplication_results(self, results: List[DeduplicationResult], batch_size: int = DEFAULT_BATCH_SIZE) -> None:
+        """以分批的方式，批量插入去重结果记录。"""
         with self.get_session() as session:
-            session.bulk_save_objects(results)
-            session.commit()
+            for batch in _batch_iterator(results, batch_size):
+                session.bulk_save_objects(batch)
+                session.commit()
+            logging.info(f"成功分批插入 {len(results)} 条去重结果。")
 
-    def bulk_insert_rename_results(self, results: List[RenameResult]) -> None:
-        """
-        批量插入重命名结果记录。
-        """
+    def bulk_insert_rename_results(self, results: List[RenameResult], batch_size: int = DEFAULT_BATCH_SIZE) -> None:
+        """以分批的方式，批量插入重命名结果记录。"""
         with self.get_session() as session:
-            session.bulk_save_objects(results)
-            session.commit()
+            for batch in _batch_iterator(results, batch_size):
+                session.bulk_save_objects(batch)
+                session.commit()
+            logging.info(f"成功分批插入 {len(results)} 条重命名结果。")
 
-    def bulk_insert_search_results(self, results: List[SearchResult]) -> None:
-        """
-        批量插入搜索结果记录。
-        """
+    def bulk_insert_search_results(self, results: List[SearchResult], batch_size: int = DEFAULT_BATCH_SIZE) -> None:
+        """以分批的方式，批量插入搜索结果记录。"""
         with self.get_session() as session:
-            session.bulk_save_objects(results)
-            session.commit()
+            for batch in _batch_iterator(results, batch_size):
+                session.bulk_save_objects(batch)
+                session.commit()
+            logging.info(f"成功分批插入 {len(results)} 条搜索结果。")

@@ -48,7 +48,6 @@ class Document(Base):
     # 文件在中间文件夹中的绝对、规范化路径。
     file_path: Mapped[str] = mapped_column(String(1024), nullable=False, unique=True)
     
-    # --- 新增字段 ---
     # 存储从文件中提取并清洗后的文本切片，避免重复计算。
     content_slice: Mapped[str] = mapped_column(Text, nullable=True)
     
@@ -56,7 +55,7 @@ class Document(Base):
     # 此字段可以为空，因为向量化是一个独立步骤。
     feature_vector: Mapped[str] = mapped_column(Text, nullable=True)
 
-# --- 新增：任务运行与结果持久化模型 ---
+# --- 任务运行与结果持久化模型 ---
 
 class TaskRun(Base):
     """

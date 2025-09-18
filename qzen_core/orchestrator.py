@@ -66,10 +66,21 @@ class Orchestrator:
         os.makedirs(intermediate_path, exist_ok=True)
 
     def run_deduplication_core(self, source_path: str, intermediate_path: str, allowed_extensions: Set[str], progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> Tuple[str, List[DeduplicationResult]]:
-        """执行核心的去重逻辑，并将结果存入数据库。"""
+        """
+        执行核心的去重与预处理流程。
+
+        此过程是所有后续分析的基础，它负责：
+        1.  通过文件哈希识别源文件夹中的唯一文件。
+        2.  将唯一的、未重复的文件复制到中间目录。
+        3.  对每个唯一文件，调用 `file_handler` 计算并清洗其“内容切片”。
+        4.  将文件的哈希、路径、内容切片等核心元数据作为一条 `Document` 记录，
+            存入数据库，以实现“一次提取，多次使用”的高效缓存策略。
+        5.  记录所有被识别为重复的文件，并将其存入数据库。
+        """
         task_run = self.db_handler.create_task_run(task_type='deduplication')
         files_to_scan = list(file_handler.scan_files(source_path, allowed_extensions))
-        total_files, processed_hashes, new_docs_to_save, deduplication_results = len(files_to_scan), {}, [], []
+        total_files = len(files_to_scan)
+        processed_hashes, new_docs_to_save, deduplication_results, skipped_files = {}, [], [], []
 
         for i, file_path in enumerate(files_to_scan):
             if is_cancelled_callback():
@@ -81,15 +92,17 @@ class Orchestrator:
                 processed_hashes[file_hash] = file_path
                 destination_path = os.path.normpath(os.path.join(intermediate_path, os.path.relpath(file_path, source_path)))
                 os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-                shutil.copy2(file_path, destination_path)
-                
-                # --- 修改点 1: 在此处一次性计算并准备存储内容切片 ---
-                content_slice = file_handler.get_content_slice(destination_path, self.slice_size_kb)
-                new_docs_to_save.append(Document(
-                    file_hash=file_hash, 
-                    file_path=destination_path,
-                    content_slice=content_slice  # 假设 Document 模型已有此字段
-                ))
+                try:
+                    shutil.copy2(file_path, destination_path)
+                    content_slice = file_handler.get_content_slice(destination_path, self.slice_size_kb)
+                    new_docs_to_save.append(Document(
+                        file_hash=file_hash, 
+                        file_path=destination_path,
+                        content_slice=content_slice
+                    ))
+                except PermissionError:
+                    logging.warning(f"权限错误：无法复制文件 {file_path} 到 {destination_path}，可能文件已被锁定。将跳过此文件。")
+                    skipped_files.append(file_path)
             elif file_hash:
                 deduplication_results.append(DeduplicationResult(task_run_id=task_run.id, duplicate_file_path=file_path, original_file_hash=file_hash))
 
@@ -98,17 +111,22 @@ class Orchestrator:
         
         self._is_engine_primed = False
         summary = f"去重任务完成！共找到 {len(deduplication_results)} 个重复文件。"
+        if skipped_files:
+            summary += f" \n\n警告：有 {len(skipped_files)} 个文件因权限问题被跳过（可能已被其他程序锁定）。"
         summary += " 仅显示前100条，完整结果已存入数据库。" if len(deduplication_results) > 100 else " 详情已存入数据库。"
         self.db_handler.update_task_summary(task_run.id, summary)
         return summary, deduplication_results[:100]
 
     def run_vectorization(self, progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> str:
-        """为数据库中尚未处理的文档计算并存储其特征向量。"""
+        """
+        为数据库中尚未处理的文档计算并存储其特征向量。
+
+        此方法直接从数据库中批量获取预先存储的 `content_slice`，而不再执行
+        任何文件I/O操作，从而极大地提高了后续向量化计算的效率。
+        """
         docs_to_vectorize = self.db_handler.get_documents_without_vectors()
         if not docs_to_vectorize: return "所有文档均已向量化，无需操作。"
 
-        # --- 修改点 2: 直接从 Document 对象获取预先存储的内容切片 --- 
-        # 确保 doc.content_slice 不为 None，提供一个默认空字符串以增强健壮性
         content_slices = [(doc.content_slice or "") for doc in docs_to_vectorize]
         feature_matrix = self.similarity_engine.vectorize_documents(content_slices)
         
@@ -124,7 +142,12 @@ class Orchestrator:
         return f"向量化任务已成功完成，处理了 {len(docs_to_vectorize)} 个文档。"
 
     def prime_similarity_engine(self, force_reload: bool = False, is_cancelled_callback: Callable[[], bool] = lambda: False) -> None:
-        """预热相似度引擎。"""
+        """
+        预热相似度引擎。
+
+        此方法从数据库加载所有已计算的特征向量，并将它们组装成一个大的
+        内存矩阵，以供后续的快速近邻搜索。
+        """
         if self._is_engine_primed and not force_reload:
             return
         all_docs = self.db_handler.get_all_documents()
@@ -175,7 +198,7 @@ class Orchestrator:
         if not clusters: return "在当前相似度阈值下，没有找到可以构成簇的相似文档。", []
             
         os.makedirs(target_path, exist_ok=True)
-        rename_results = []
+        rename_results, skipped_files = [], []
         for i, cluster_indices in enumerate(clusters):
             if is_cancelled_callback():
                 logging.info("聚类任务被用户取消。")
@@ -191,11 +214,17 @@ class Orchestrator:
                 _, extension = os.path.splitext(original_path)
                 new_filename = f"{cluster_prefix}_{j+1}{extension}"
                 destination_path = os.path.join(cluster_dir, new_filename)
-                shutil.copy2(original_path, destination_path)
-                rename_results.append(RenameResult(task_run_id=task_run.id, original_file_path=original_path, new_file_path=destination_path))
+                try:
+                    shutil.copy2(original_path, destination_path)
+                    rename_results.append(RenameResult(task_run_id=task_run.id, original_file_path=original_path, new_file_path=destination_path))
+                except PermissionError:
+                    logging.warning(f"权限错误：无法复制文件 {original_path} 到 {destination_path}，可能文件已被锁定。将跳过此文件。")
+                    skipped_files.append(original_path)
 
         if rename_results: self.db_handler.bulk_insert_rename_results(rename_results)
         summary = f"聚类完成！共创建 {len(clusters)} 个簇，重命名了 {len(rename_results)} 个文件。"
+        if skipped_files:
+            summary += f" \n\n警告：有 {len(skipped_files)} 个文件因权限问题被跳过（可能已被其他程序锁定）。"
         summary += " 仅显示前100条，完整结果已存入数据库。" if len(rename_results) > 100 else " 详情已存入数据库。"
         self.db_handler.update_task_summary(task_run.id, summary)
         return summary, rename_results[:100]
@@ -214,20 +243,31 @@ class Orchestrator:
             
         destination_dir = os.path.join(target_path, f"文件名包含_{keyword}")
         os.makedirs(destination_dir, exist_ok=True)
+        skipped_files = []
         for i, file_path in enumerate(matched_files):
             if is_cancelled_callback():
                 logging.info("文件名搜索任务被用户取消。")
                 return "任务已取消", []
             progress_callback(i + 1, len(matched_files), f"正在复制: {os.path.basename(file_path)}")
-            shutil.copy2(file_path, destination_dir)
+            try:
+                shutil.copy2(file_path, destination_dir)
+            except PermissionError:
+                logging.warning(f"权限错误：无法将搜索到的文件 {file_path} 复制到目标目录，可能文件已被锁定。将跳过复制。")
+                skipped_files.append(file_path)
             
         summary = f"文件名搜索完成！共找到并复制了 {len(matched_files)} 个文件。"
+        if skipped_files:
+            summary += f" \n\n警告：有 {len(skipped_files)} 个文件因权限问题被跳过（可能已被其他程序锁定）。"
         summary += " 仅显示前100条，完整结果已存入数据库。" if len(matched_files) > 100 else " 详情已存入数据库。"
         self.db_handler.update_task_summary(task_run.id, summary)
         return summary, search_results[:100]
 
     def run_content_search(self, keyword: str, target_path: str, progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> Tuple[str, List[SearchResult]]:
-        """在所有文档的内容切片中搜索关键词，并将结果存入数据库。"""
+        """
+        在所有文档的预存内容切片中搜索关键词。
+
+        此方法直接从数据库读取 `content_slice` 进行匹配，避免了重复的文件读取和解析。
+        """
         task_run = self.db_handler.create_task_run(task_type='content_search')
         all_docs = self.db_handler.get_all_documents()
         if not all_docs: return "数据库中没有可供搜索的文档记录。", []
@@ -239,7 +279,6 @@ class Orchestrator:
                 return "任务已取消", []
             progress_callback(i + 1, len(all_docs), f"正在扫描: {os.path.basename(doc.file_path)}")
             
-            # --- 修改点 3: 直接从 Document 对象获取内容切片进行搜索 ---
             content_slice = doc.content_slice or "" # 确保 content_slice 不为 None
             if keyword.lower() in content_slice.lower():
                 matched_paths.append(doc.file_path)
@@ -251,14 +290,21 @@ class Orchestrator:
             
         destination_dir = os.path.join(target_path, f"内容包含_{keyword}")
         os.makedirs(destination_dir, exist_ok=True)
+        skipped_files = []
         for i, file_path in enumerate(matched_paths):
             if is_cancelled_callback():
                 logging.info("内容搜索任务被用户取消。")
                 return "任务已取消", []
             progress_callback(i + 1, len(matched_paths), f"正在复制: {os.path.basename(file_path)}")
-            shutil.copy2(file_path, destination_dir)
+            try:
+                shutil.copy2(file_path, destination_dir)
+            except PermissionError:
+                logging.warning(f"权限错误：无法将搜索到的文件 {file_path} 复制到目标目录，可能文件已被锁定。将跳过复制。")
+                skipped_files.append(file_path)
             
         summary = f"文件内容搜索完成！共找到并复制了 {len(matched_paths)} 个文件。"
+        if skipped_files:
+            summary += f" \n\n警告：有 {len(skipped_files)} 个文件因权限问题被跳过（可能已被其他程序锁定）。"
         summary += " 仅显示前100条，完整结果已存入数据库。" if len(matched_paths) > 100 else " 详情已存入数据库。"
         self.db_handler.update_task_summary(task_run.id, summary)
         return summary, search_results[:100]
