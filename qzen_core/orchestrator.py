@@ -206,17 +206,18 @@ class Orchestrator:
 
         task_run = self.db_handler.create_task_run(task_type='topic_clustering')
         clusters = self.cluster_engine.cluster_documents(self.similarity_engine.feature_matrix, similarity_threshold)
-        if not clusters: return "在当前相似度阈值下，没有找到可以构成簇的相似文档。", []
-            
+        
         os.makedirs(target_path, exist_ok=True)
         grouping_results, skipped_files = [], []
-        
+        clustered_indices = set()
+
         for i, cluster_indices in enumerate(clusters):
             if is_cancelled_callback():
                 logging.info("主题聚类任务被用户取消。")
                 return "任务已取消", []
             progress_callback(i + 1, len(clusters), f"正在处理第 {i+1} 个文件簇...")
             
+            clustered_indices.update(cluster_indices)
             cluster_matrix = self.similarity_engine.feature_matrix[cluster_indices]
             mean_vector = np.array(cluster_matrix.mean(axis=0)).flatten()
             top_feature_indices = mean_vector.argsort()[::-1][:10]
@@ -243,8 +244,35 @@ class Orchestrator:
                     logging.warning(f"权限错误：无法复制文件 {original_path} 到 {destination_path}，可能文件已被锁定。将跳过此文件。")
                     skipped_files.append(original_path)
 
+        # 处理未归类的文件
+        all_indices = set(range(self.similarity_engine.feature_matrix.shape[0]))
+        unclustered_indices = all_indices - clustered_indices
+        unclustered_count = 0
+        if unclustered_indices:
+            unclustered_dir = os.path.join(target_path, "未归类")
+            os.makedirs(unclustered_dir, exist_ok=True)
+            logging.info(f"找到 {len(unclustered_indices)} 个未归类文件，将它们复制到 '{unclustered_dir}'")
+
+            for idx in unclustered_indices:
+                if is_cancelled_callback():
+                    logging.info("主题聚类任务在处理未归类文件时被用户取消。")
+                    break
+                original_path = self._doc_path_map[idx]
+                destination_path = os.path.join(unclustered_dir, os.path.basename(original_path))
+                try:
+                    shutil.copy2(original_path, destination_path)
+                    unclustered_count += 1
+                except PermissionError:
+                    logging.warning(f"权限错误：无法复制未归类文件 {original_path} 到 {destination_path}，可能文件已被锁定。将跳过此文件。")
+                    skipped_files.append(original_path)
+
         if grouping_results: self.db_handler.bulk_insert_rename_results(grouping_results)
+        
         summary = f"主题聚类完成！共创建 {len(clusters)} 个主题文件夹，整理了 {len(grouping_results)} 个文件。"
+        if unclustered_count > 0:
+            summary += f" 另有 {unclustered_count} 个文件被移至“未归类”文件夹。"
+        if not clusters and unclustered_count > 0:
+             summary = f"在当前相似度阈值下，没有找到可以构成簇的相似文档。所有 {unclustered_count} 个文件已被移至“未归类”文件夹。"
         if skipped_files:
             summary += f" \n\n警告：有 {len(skipped_files)} 个文件因权限问题被跳过（可能已被其他程序锁定）。"
         summary += " 仅显示前100条，完整结果已存入数据库。" if len(grouping_results) > 100 else " 详情已存入数据库。"
