@@ -12,7 +12,7 @@ from contextlib import contextmanager
 import logging
 from typing import Generator, List, Optional
 
-from sqlalchemy import create_engine, NullPool, Text
+from sqlalchemy import create_engine, NullPool, StaticPool, Text
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.engine import Engine
 
@@ -51,18 +51,28 @@ class DatabaseHandler:
     def _get_engine(self) -> Engine:
         """获取或创建 SQLAlchemy Engine 实例（懒加载）。"""
         if self._engine is None:
-            connect_args = {
-                # 设置一个连接超时，以避免在数据库无响应时程序无限期等待
-                'connection_timeout': 15
-            }
+            pool_opts = {}
+            connect_args = {}
+
+            # 为内存数据库（用于测试）和真实数据库（如DM8）配置不同的连接池和参数
+            if self._db_url == "sqlite:///:memory:":
+                # 对于内存SQLite，必须在所有操作中使用同一个连接，否则表会丢失。
+                # StaticPool 确保了这一点。
+                pool_opts['poolclass'] = StaticPool
+                # check_same_thread=False 是SQLite在多线程测试环境下的要求
+                connect_args['check_same_thread'] = False
+            else:
+                # 对于真实的、基于网络的数据库，使用NullPool更简单健壮，
+                # 避免了处理闲置连接被服务器关闭的问题。
+                pool_opts['poolclass'] = NullPool
+                # 仅对网络数据库设置连接超时
+                connect_args['connection_timeout'] = 15
+
             self._engine = create_engine(
                 self._db_url,
                 echo=self._echo,
-                # 使用 NullPool 禁用连接池。对于桌面应用或脚本，每次操作
-                # 使用新的连接然后关闭是更简单和健壮的模式，避免了处理
-                # 长时间闲置后连接被数据库服务器关闭的问题。
-                poolclass=NullPool,
-                connect_args=connect_args
+                connect_args=connect_args,
+                **pool_opts
             )
         return self._engine
 
@@ -99,7 +109,7 @@ class DatabaseHandler:
             session.rollback()
             raise
         finally:
-            # 无论成功与否，最终都要关闭会话，将连接交还给（空的）连接池
+            # 无论成功与否，最终都要关闭会话，将连接交还给连接池
             session.close()
 
     def recreate_tables(self) -> None:
@@ -160,8 +170,7 @@ class DatabaseHandler:
             documents: 一个 `Document` 对象的列表，这些对象将被添加到数据库中。
         """
         with self.get_session() as session:
-            with session.begin():
-                session.bulk_save_objects(documents)
+            session.bulk_save_objects(documents)
             session.commit()
 
     def bulk_update_documents(self, documents: List[Document]) -> None:
@@ -213,20 +222,21 @@ class DatabaseHandler:
     def bulk_insert_deduplication_results(self, results: List[DeduplicationResult]) -> None:
         """批量插入去重结果记录。"""
         with self.get_session() as session:
-            with session.begin():
-                session.bulk_save_objects(results)
+            session.bulk_save_objects(results)
             session.commit()
 
     def bulk_insert_rename_results(self, results: List[RenameResult]) -> None:
-        """批量插入重命名结果记录。"""
+        """
+        批量插入重命名结果记录。
+        """
         with self.get_session() as session:
-            with session.begin():
-                session.bulk_save_objects(results)
+            session.bulk_save_objects(results)
             session.commit()
 
     def bulk_insert_search_results(self, results: List[SearchResult]) -> None:
-        """批量插入搜索结果记录。"""
+        """
+        批量插入搜索结果记录。
+        """
         with self.get_session() as session:
-            with session.begin():
-                session.bulk_save_objects(results)
+            session.bulk_save_objects(results)
             session.commit()

@@ -22,7 +22,7 @@ class TestDatabaseHandler(unittest.TestCase):
         # 使用内存SQLite数据库进行快速、隔离的测试
         self.db_handler = DatabaseHandler(db_url="sqlite:///:memory:")
         # 在内存数据库中创建表
-        self.db_handler.create_tables()
+        self.db_handler.recreate_tables()
 
     def test_document_operations(self):
         """测试针对 Document 模型的增、查、改操作。"""
@@ -32,8 +32,8 @@ class TestDatabaseHandler(unittest.TestCase):
         doc3 = Document(file_hash="hash3", file_path="/path/doc3.docx")
         initial_docs = [doc1, doc2, doc3]
 
-        # 2. 测试批量保存
-        self.db_handler.bulk_save_documents(initial_docs)
+        # 2. 测试批量插入
+        self.db_handler.bulk_insert_documents(initial_docs)
 
         # 3. 测试 get_all_documents
         all_docs = self.db_handler.get_all_documents()
@@ -52,7 +52,7 @@ class TestDatabaseHandler(unittest.TestCase):
         doc1_from_db = next(d for d in all_docs if d.file_hash == "hash1")
         self.assertIsNone(doc1_from_db.feature_vector)
         doc1_from_db.feature_vector = b'new_vector1'
-        self.db_handler.bulk_save_documents([doc1_from_db])
+        self.db_handler.bulk_update_documents([doc1_from_db])
 
         # 再次查询，验证向量已更新
         docs_needing_vectors_after_update = self.db_handler.get_documents_without_vectors()

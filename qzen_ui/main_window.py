@@ -6,21 +6,26 @@ Qzen 主窗口模块。
 """
 
 import os
-import shutil
+import logging
 from typing import Tuple, List, Callable
+
 from PyQt6.QtWidgets import (
     QMainWindow, QMessageBox, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QFileDialog, QProgressBar, QListWidget,
-    QTableWidget, QTableWidgetItem, QHeaderView, QDoubleSpinBox, QTabWidget, QSpinBox, QMenu
+    QTableWidget, QTableWidgetItem, QHeaderView, QDoubleSpinBox, QTabWidget,
+    QSpinBox, QMenu
 )
 from PyQt6.QtGui import QAction, QCloseEvent, QIcon, QGuiApplication
 from PyQt6.QtCore import Qt, pyqtSignal
-import logging
 
+# 本地导入
+from qzen_ui.config_dialog import ConfigDialog
+from qzen_ui.worker import Worker
 from qzen_data import file_handler
+from qzen_data.database_handler import DatabaseHandler
 from qzen_data.models import DeduplicationResult, RenameResult, SearchResult
 from qzen_utils import config_manager
-from qzen_ui.worker import Worker
+from qzen_core.orchestrator import Orchestrator
 
 SUPPORTED_EXTENSIONS = {
     '.txt', '.md', '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
@@ -43,8 +48,12 @@ class MainWindow(QMainWindow):
         self.setGeometry(100, 100, 1200, 800)
         self.setWindowIcon(QIcon("logo.ico"))
 
-        self._create_central_widget()
+        # 初始化UI组件
         self._create_menus()
+        self._create_central_widget()
+        self._connect_signals()
+
+        # 加载状态
         self._load_app_config()
         self._update_tab_states()
 
@@ -53,88 +62,102 @@ class MainWindow(QMainWindow):
     def _create_menus(self):
         menu_bar = self.menuBar()
         help_menu = menu_bar.addMenu("帮助(&H)")
-        about_action = QAction("关于 Qzen...", self)
-        about_action.triggered.connect(self.show_about_dialog)
-        help_menu.addAction(about_action)
-
-    def show_about_dialog(self):
-        QMessageBox.about(self, "关于 Qzen (千针)", "<p><b>Qzen (千针) v1.0</b></p><p>本地文档智能整理客户端。</p>")
+        self.about_action = QAction("关于 Qzen...", self)
+        help_menu.addAction(self.about_action)
 
     def _create_central_widget(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
+
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
 
-        setup_tab, processing_tab, analysis_tab, organize_tab, keyword_search_tab = QWidget(), QWidget(), QWidget(), QWidget(), QWidget()
+        # 创建并添加标签页
+        setup_tab = self._create_setup_tab()
+        processing_tab = self._create_processing_tab()
+        analysis_tab = self._create_analysis_tab()
+        organize_tab = self._create_organize_tab()
+        keyword_search_tab = self._create_keyword_search_tab()
+
         self.tabs.addTab(setup_tab, "1. 配置")
         self.tabs.addTab(processing_tab, "2. 批量处理")
         self.tabs.addTab(analysis_tab, "3. 交互式分析")
         self.tabs.addTab(organize_tab, "4. 自动整理")
         self.tabs.addTab(keyword_search_tab, "5. 关键词搜索")
 
-        # --- 1. 配置标签页布局 ---
-        setup_layout = QGridLayout(setup_tab)
-        self.db_config_button = QPushButton("第一步：配置数据库")
-        setup_layout.addWidget(self.db_config_button, 0, 0, 1, 3)
+        # 创建底部状态栏
+        status_layout = self._create_status_layout()
+        main_layout.addLayout(status_layout)
 
-        setup_layout.addWidget(QLabel("第二步：源文件夹:"), 1, 0)
+    def _create_setup_tab(self) -> QWidget:
+        setup_tab = QWidget()
+        layout = QGridLayout(setup_tab)
+        self.db_config_button = QPushButton("第一步：配置数据库")
+        layout.addWidget(self.db_config_button, 0, 0, 1, 3)
+
+        layout.addWidget(QLabel("第二步：源文件夹:"), 1, 0)
         self.source_dir_input = QLineEdit()
         self.source_dir_button = QPushButton("选择...")
-        setup_layout.addWidget(self.source_dir_input, 1, 1)
-        setup_layout.addWidget(self.source_dir_button, 1, 2)
+        layout.addWidget(self.source_dir_input, 1, 1)
+        layout.addWidget(self.source_dir_button, 1, 2)
 
-        setup_layout.addWidget(QLabel("第三步：中间文件夹:"), 2, 0)
+        layout.addWidget(QLabel("第三步：中间文件夹:"), 2, 0)
         self.intermediate_dir_input = QLineEdit()
         self.intermediate_dir_button = QPushButton("选择...")
-        setup_layout.addWidget(self.intermediate_dir_input, 2, 1)
-        setup_layout.addWidget(self.intermediate_dir_button, 2, 2)
+        layout.addWidget(self.intermediate_dir_input, 2, 1)
+        layout.addWidget(self.intermediate_dir_button, 2, 2)
 
-        setup_layout.addWidget(QLabel("第四步：目标文件夹:"), 3, 0)
+        layout.addWidget(QLabel("第四步：目标文件夹:"), 3, 0)
         self.target_dir_input = QLineEdit()
         self.target_dir_button = QPushButton("选择...")
-        setup_layout.addWidget(self.target_dir_input, 3, 1)
-        setup_layout.addWidget(self.target_dir_button, 3, 2)
+        layout.addWidget(self.target_dir_input, 3, 1)
+        layout.addWidget(self.target_dir_button, 3, 2)
         
-        setup_layout.addWidget(QLabel("--- 高级参数配置 ---"), 4, 0, 1, 3)
-        max_features_label = QLabel("TF-IDF 最大特征数 (?)")
+        layout.addWidget(QLabel("--- 高级参数配置 ---"), 4, 0, 1, 3)
+        max_features_label = QLabel("TF-IDF 最大特征数 (?):")
         max_features_label.setToolTip("控制用于文本分析的词汇量。\n默认值: 5000。\n处理专业领域或多种语言的文档时，可适当调高此值以提高精度，\n但这会增加内存消耗和计算时间。")
         self.max_features_spinbox = QSpinBox()
         self.max_features_spinbox.setRange(1000, 50000)
         self.max_features_spinbox.setSingleStep(1000)
-        setup_layout.addWidget(max_features_label, 5, 0)
-        setup_layout.addWidget(self.max_features_spinbox, 5, 1)
+        layout.addWidget(max_features_label, 5, 0)
+        layout.addWidget(self.max_features_spinbox, 5, 1)
 
-        slice_size_label = QLabel("内容切片大小 (KB) (?)")
+        slice_size_label = QLabel("内容切片大小 (KB) (?):")
         slice_size_label.setToolTip("为计算文档相似度而提取的文档首尾部分的大小。\n默认值: 1 KB。\n增加此值可以更准确地代表长文档的核心内容，但同样会增加内存和计算开销。")
         self.slice_size_spinbox = QSpinBox()
         self.slice_size_spinbox.setRange(1, 10)
-        setup_layout.addWidget(slice_size_label, 6, 0)
-        setup_layout.addWidget(self.slice_size_spinbox, 6, 1)
-        setup_layout.setRowStretch(7, 1)
+        layout.addWidget(slice_size_label, 6, 0)
+        layout.addWidget(self.slice_size_spinbox, 6, 1)
+        layout.setRowStretch(7, 1)
+        return setup_tab
 
-        # --- 2. 批量处理标签页布局 ---
-        processing_layout = QVBoxLayout(processing_tab)
+    def _create_processing_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
         self.deduplicate_button = QPushButton("执行去重")
         self.vectorize_button = QPushButton("执行向量化")
-        processing_layout.addWidget(self.deduplicate_button)
-        processing_layout.addWidget(self.vectorize_button)
+        layout.addWidget(self.deduplicate_button)
+        layout.addWidget(self.vectorize_button)
+        
         self.deduplication_results_widget = QListWidget()
         self.deduplication_results_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        processing_layout.addWidget(QLabel("去重结果 (重复文件列表):"))
-        processing_layout.addWidget(self.deduplication_results_widget)
+        layout.addWidget(QLabel("去重结果 (重复文件列表):"))
+        layout.addWidget(self.deduplication_results_widget)
+        return tab
 
-        # --- 3. 交互式分析标签页布局 ---
-        analysis_layout = QHBoxLayout(analysis_tab)
+    def _create_analysis_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        
         file_list_layout = QVBoxLayout()
         self.load_files_button = QPushButton("加载文件列表并预热引擎")
         self.file_list_widget = QListWidget()
         self.find_similar_button = QPushButton("查找相似文件")
-        self.find_similar_button.setEnabled(False)
         file_list_layout.addWidget(self.load_files_button)
         file_list_layout.addWidget(self.file_list_widget)
         file_list_layout.addWidget(self.find_similar_button)
+        
         results_layout = QVBoxLayout()
         results_layout.addWidget(QLabel("相似文件搜索结果:"))
         self.results_table_widget = QTableWidget()
@@ -144,74 +167,100 @@ class MainWindow(QMainWindow):
         self.results_table_widget.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.results_table_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         results_layout.addWidget(self.results_table_widget)
-        analysis_layout.addLayout(file_list_layout, 1)
-        analysis_layout.addLayout(results_layout, 2)
+        
+        layout.addLayout(file_list_layout, 1)
+        layout.addLayout(results_layout, 2)
+        return tab
 
-        # --- 4. 自动整理标签页布局 ---
-        organize_layout = QVBoxLayout(organize_tab)
-        cluster_controls_layout = QHBoxLayout()
-        cluster_controls_layout.addWidget(QLabel("相似度阈值:"))
+    def _create_organize_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(QLabel("相似度阈值:"))
         self.similarity_threshold_spinbox = QDoubleSpinBox()
         self.similarity_threshold_spinbox.setRange(0.0, 1.0)
         self.similarity_threshold_spinbox.setSingleStep(0.05)
         self.similarity_threshold_spinbox.setValue(0.85)
         self.cluster_button = QPushButton("聚类并重命名")
-        cluster_controls_layout.addWidget(self.similarity_threshold_spinbox)
-        cluster_controls_layout.addWidget(self.cluster_button)
-        cluster_controls_layout.addStretch()
-        organize_layout.addLayout(cluster_controls_layout)
+        controls_layout.addWidget(self.similarity_threshold_spinbox)
+        controls_layout.addWidget(self.cluster_button)
+        controls_layout.addStretch()
+        layout.addLayout(controls_layout)
+        
         self.rename_results_table_widget = QTableWidget()
         self.rename_results_table_widget.setColumnCount(2)
         self.rename_results_table_widget.setHorizontalHeaderLabels(["原文件名", "新文件名"])
         self.rename_results_table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.rename_results_table_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        organize_layout.addWidget(QLabel("重命名结果:"))
-        organize_layout.addWidget(self.rename_results_table_widget)
+        layout.addWidget(QLabel("重命名结果:"))
+        layout.addWidget(self.rename_results_table_widget)
+        return tab
 
-        # --- 5. 关键词搜索标签页布局 ---
-        keyword_search_layout = QVBoxLayout(keyword_search_tab)
-        keyword_input_layout = QHBoxLayout()
+    def _create_keyword_search_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        
+        input_layout = QHBoxLayout()
         self.keyword_input = QLineEdit()
         self.keyword_input.setPlaceholderText("在此输入关键词...")
-        keyword_input_layout.addWidget(QLabel("关键词:"))
-        keyword_input_layout.addWidget(self.keyword_input)
+        input_layout.addWidget(QLabel("关键词:"))
+        input_layout.addWidget(self.keyword_input)
+        
         self.filename_search_button = QPushButton("按文件名搜索")
         self.content_search_button = QPushButton("按文件内容搜索")
-        keyword_search_layout.addLayout(keyword_input_layout)
-        keyword_search_layout.addWidget(self.filename_search_button)
-        keyword_search_layout.addWidget(self.content_search_button)
+        layout.addLayout(input_layout)
+        layout.addWidget(self.filename_search_button)
+        layout.addWidget(self.content_search_button)
+        
         self.keyword_search_results_widget = QListWidget()
         self.keyword_search_results_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        keyword_search_layout.addWidget(QLabel("搜索结果:"))
-        keyword_search_layout.addWidget(self.keyword_search_results_widget)
+        layout.addWidget(QLabel("搜索结果:"))
+        layout.addWidget(self.keyword_search_results_widget)
+        return tab
 
-        # --- 底部进度条和取消按钮 ---
-        bottom_layout = QHBoxLayout()
+    def _create_status_layout(self) -> QHBoxLayout:
+        layout = QHBoxLayout()
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.cancel_button = QPushButton("取消任务")
         self.cancel_button.setVisible(False)
-        bottom_layout.addWidget(self.progress_bar)
-        bottom_layout.addWidget(self.cancel_button)
-        main_layout.addLayout(bottom_layout)
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.cancel_button)
+        return layout
 
-        # --- 连接信号 ---
+    def _connect_signals(self):
+        # 菜单
+        self.about_action.triggered.connect(self.show_about_dialog)
+
+        # 1. 配置
         self.db_config_button.clicked.connect(self.show_db_config_dialog)
         self.source_dir_button.clicked.connect(lambda: self._select_directory(self.source_dir_input, "选择源文件夹"))
         self.intermediate_dir_button.clicked.connect(lambda: self._select_directory(self.intermediate_dir_input, "选择中间文件夹"))
         self.target_dir_button.clicked.connect(lambda: self._select_directory(self.target_dir_input, "选择目标文件夹"))
+
+        # 2. 批量处理
         self.deduplicate_button.clicked.connect(self.start_deduplication)
         self.vectorize_button.clicked.connect(self.start_vectorization)
+        self.deduplication_results_widget.customContextMenuRequested.connect(self._show_context_menu)
+
+        # 3. 交互式分析
         self.load_files_button.clicked.connect(self.load_intermediate_files)
         self.file_list_widget.itemSelectionChanged.connect(self.update_button_states)
         self.find_similar_button.clicked.connect(self.on_find_similar_clicked)
+        self.results_table_widget.customContextMenuRequested.connect(self._show_context_menu)
+
+        # 4. 自动整理
         self.cluster_button.clicked.connect(self.start_clustering_and_renaming)
+        self.rename_results_table_widget.customContextMenuRequested.connect(self._show_context_menu)
+
+        # 5. 关键词搜索
         self.filename_search_button.clicked.connect(self.start_filename_search)
         self.content_search_button.clicked.connect(self.start_content_search)
-        self.deduplication_results_widget.customContextMenuRequested.connect(self._show_context_menu)
-        self.results_table_widget.customContextMenuRequested.connect(self._show_context_menu)
-        self.rename_results_table_widget.customContextMenuRequested.connect(self._show_context_menu)
         self.keyword_search_results_widget.customContextMenuRequested.connect(self._show_context_menu)
+
+    def show_about_dialog(self):
+        QMessageBox.about(self, "关于 Qzen (千针)", "<p><b>Qzen (千针) v1.0</b></p><p>本地文档智能整理客户端。</p>")
 
     def _update_tab_states(self):
         is_db_configured = self.orchestrator is not None
@@ -329,9 +378,6 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def show_db_config_dialog(self):
-        from qzen_ui.config_dialog import ConfigDialog
-        from qzen_data.database_handler import DatabaseHandler
-        from qzen_core.orchestrator import Orchestrator
         dialog = ConfigDialog(self)
         if not dialog.exec():
             return
@@ -401,11 +447,6 @@ class MainWindow(QMainWindow):
             self.on_vectorization_finished,
             progress_callback=self._thread_safe_progress_callback
         )
-
-    def on_vectorization_finished(self, message: str):
-        self.on_task_finished(message)
-        self._is_vectorized = True
-        self._update_tab_states()
 
     def load_intermediate_files(self):
         intermediate_dir = self.intermediate_dir_input.text()
@@ -511,19 +552,10 @@ class MainWindow(QMainWindow):
 
     def _show_context_menu(self, point):
         sender_widget = self.sender()
-        if sender_widget is None: return
+        if sender_widget is None:
+            return
 
-        file_path = None
-        if isinstance(sender_widget, QListWidget):
-            item = sender_widget.itemAt(point)
-            if item: file_path = item.text()
-        elif isinstance(sender_widget, QTableWidget):
-            item = sender_widget.itemAt(point)
-            if item:
-                col = 1 if sender_widget is self.rename_results_table_widget else 0
-                path_item = sender_widget.item(item.row(), col)
-                if path_item: file_path = path_item.text()
-
+        file_path = self._get_filepath_from_widget(sender_widget, point)
         if not file_path or not os.path.exists(os.path.dirname(file_path)):
             return
 
@@ -538,9 +570,26 @@ class MainWindow(QMainWindow):
         menu.addAction(copy_path_action)
         menu.exec(sender_widget.mapToGlobal(point))
 
+    def _get_filepath_from_widget(self, widget: QWidget, point) -> str | None:
+        file_path = None
+        if isinstance(widget, QListWidget):
+            item = widget.itemAt(point)
+            if item:
+                file_path = item.text()
+        elif isinstance(widget, QTableWidget):
+            item = widget.itemAt(point)
+            if item:
+                # 对于重命名结果表格，新文件路径在第1列
+                col = 1 if widget is self.rename_results_table_widget else 0
+                path_item = widget.item(item.row(), col)
+                if path_item:
+                    file_path = path_item.text()
+        return file_path
+
     def _open_folder_for_item(self, file_path: str):
         try:
-            os.startfile(os.path.dirname(file_path))
+            # 使用 os.path.normpath 确保路径格式正确
+            os.startfile(os.path.dirname(os.path.normpath(file_path)))
         except Exception as e:
             logging.error(f"无法打开文件夹: {e}")
             QMessageBox.warning(self, "错误", f"无法打开文件夹：\n{os.path.dirname(file_path)}")
