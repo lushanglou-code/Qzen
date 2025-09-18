@@ -6,9 +6,11 @@
 高效的近邻搜索算法。
 """
 
+import logging
 import pickle
 from typing import List, Tuple
 
+import jieba  # 引入 jieba 分词库
 import numpy as np
 from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -26,28 +28,70 @@ class SimilarityEngine:
         vectorizer (TfidfVectorizer): scikit-learn 的 TF-IDF 向量化器实例。
         feature_matrix (csr_matrix | None): 由 `vectorize_documents` 方法生成的
                                           文档-词项稀疏矩阵。在向量化之前为 None。
+        stopwords (set[str]): 从外部文件加载的停用词集合。
     """
 
-    def __init__(self, max_features: int = 5000):
+    def __init__(self, max_features: int = 5000, stopwords_path: str = "stopwords.txt"):
         """
-        初始化相似度引擎。
+        初始化相似度引擎，并配置中文处理流程。
 
         Args:
             max_features (int): TF-IDF 向量化器构建词汇表时使用的最大特征
                               （词汇）数量。这是控制内存使用和计算复杂度的
                               关键参数。
+            stopwords_path (str): 停用词文件的路径。
         """
-        # 初始化TF-IDF向量化器，并设置常用参数以优化性能和结果。
-        # - max_df=0.95: 忽略在超过 95% 的文档中都出现的词语（通常是无意义的常用词）。
-        # - min_df=2: 忽略在少于 2 个文档中出现的词语（过于稀有，可能对相似度贡献不大）。
-        # - stop_words='english': 使用内置的英文停用词列表。
+        self.stopwords = set()
+        self._load_stopwords(stopwords_path)
+
+        # 初始化TF-IDF向量化器，并为其配置一个完整的中文处理流程。
+        # - tokenizer: 指定我们自定义的、集成了 jieba 分词和停用词过滤的函数。
+        # - token_pattern=None: 当提供了自定义 tokenizer 时，必须将此项设为 None，
+        #                       以防止 scikit-learn 默认的、基于正则表达式的 token 
+        #                       处理器干扰我们的分词结果。
+        # - max_df/min_df: 保留原来的常用参数以优化结果。
         self.vectorizer = TfidfVectorizer(
-            max_features=max_features, 
-            max_df=0.95, 
-            min_df=2, 
-            stop_words='english'
+            max_features=max_features,
+            max_df=0.95,
+            min_df=2,
+            tokenizer=self._chinese_tokenizer,
+            token_pattern=None  # 关键步骤：禁用默认的 token 模式
         )
         self.feature_matrix: csr_matrix | None = None
+
+    def _load_stopwords(self, path: str) -> None:
+        """
+        从指定路径加载停用词列表到 self.stopwords 集合中。
+
+        Args:
+            path: 停用词文件的路径。
+        """
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    self.stopwords.add(line.strip())
+            logging.info(f"成功从 {path} 加载 {len(self.stopwords)} 个停用词。")
+        except FileNotFoundError:
+            logging.warning(f"停用词文件 {path} 未找到。将不使用停用词过滤功能。")
+
+    def _chinese_tokenizer(self, text: str) -> List[str]:
+        """
+        自定义的中文分词器，供 TfidfVectorizer 调用。
+
+        执行两个核心任务：
+        1. 使用 `jieba.cut` 进行中文分词。
+        2. 过滤掉所有停用词和长度为 1 的单字（通常是噪声）。
+
+        Args:
+            text: 已经过 `file_handler` 清洗的文本字符串。
+
+        Returns:
+            一个由干净、有意义的词语组成的列表。
+        """
+        # 使用 jieba 进行分词
+        words = jieba.cut(text)
+        # 返回不在停用词列表且长度大于1的词语
+        return [word for word in words if word not in self.stopwords and len(word) > 1]
 
     def vectorize_documents(self, documents: List[str]) -> csr_matrix:
         """

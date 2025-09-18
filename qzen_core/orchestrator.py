@@ -82,7 +82,14 @@ class Orchestrator:
                 destination_path = os.path.normpath(os.path.join(intermediate_path, os.path.relpath(file_path, source_path)))
                 os.makedirs(os.path.dirname(destination_path), exist_ok=True)
                 shutil.copy2(file_path, destination_path)
-                new_docs_to_save.append(Document(file_hash=file_hash, file_path=destination_path))
+                
+                # --- 修改点 1: 在此处一次性计算并准备存储内容切片 ---
+                content_slice = file_handler.get_content_slice(destination_path, self.slice_size_kb)
+                new_docs_to_save.append(Document(
+                    file_hash=file_hash, 
+                    file_path=destination_path,
+                    content_slice=content_slice  # 假设 Document 模型已有此字段
+                ))
             elif file_hash:
                 deduplication_results.append(DeduplicationResult(task_run_id=task_run.id, duplicate_file_path=file_path, original_file_hash=file_hash))
 
@@ -100,7 +107,9 @@ class Orchestrator:
         docs_to_vectorize = self.db_handler.get_documents_without_vectors()
         if not docs_to_vectorize: return "所有文档均已向量化，无需操作。"
 
-        content_slices = [file_handler.get_content_slice(doc.file_path, self.slice_size_kb) for doc in docs_to_vectorize]
+        # --- 修改点 2: 直接从 Document 对象获取预先存储的内容切片 --- 
+        # 确保 doc.content_slice 不为 None，提供一个默认空字符串以增强健壮性
+        content_slices = [(doc.content_slice or "") for doc in docs_to_vectorize]
         feature_matrix = self.similarity_engine.vectorize_documents(content_slices)
         
         for i, doc in enumerate(docs_to_vectorize):
@@ -229,7 +238,9 @@ class Orchestrator:
                 logging.info("内容搜索任务被用户取消。")
                 return "任务已取消", []
             progress_callback(i + 1, len(all_docs), f"正在扫描: {os.path.basename(doc.file_path)}")
-            content_slice = file_handler.get_content_slice(doc.file_path, self.slice_size_kb)
+            
+            # --- 修改点 3: 直接从 Document 对象获取内容切片进行搜索 ---
+            content_slice = doc.content_slice or "" # 确保 content_slice 不为 None
             if keyword.lower() in content_slice.lower():
                 matched_paths.append(doc.file_path)
                 

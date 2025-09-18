@@ -33,6 +33,9 @@ class Document(Base):
                        重复记录。
         file_path (str): 文档在中间文件夹中的绝对路径。此路径是唯一的，
                        用于定位文件以进行内容提取和分析。
+        content_slice (str): 从文档中提取并清洗后的内容切片，用于后续的
+                             向量化和内容搜索。提前计算并存储它可以避免
+                             重复的文件 I/O 和解析开销。
         feature_vector (str): 文档内容的 TF-IDF 特征向量，以 JSON 字符串的
                             形式存储。选择文本格式而不是二进制格式是为了
                             提高数据库的通用性和可移植性。
@@ -44,6 +47,10 @@ class Document(Base):
     
     # 文件在中间文件夹中的绝对、规范化路径。
     file_path: Mapped[str] = mapped_column(String(1024), nullable=False, unique=True)
+    
+    # --- 新增字段 ---
+    # 存储从文件中提取并清洗后的文本切片，避免重复计算。
+    content_slice: Mapped[str] = mapped_column(Text, nullable=True)
     
     # 存储 TF-IDF 计算出的特征向量，使用 JSON 文本格式以保证跨数据库的健壮性。
     # 此字段可以为空，因为向量化是一个独立步骤。

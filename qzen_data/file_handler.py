@@ -10,6 +10,7 @@
 import hashlib
 import logging
 import os
+import re  # 导入 re 模块
 from typing import Iterator
 
 # --- 引入所有需要的第三方文档解析库 ---
@@ -18,6 +19,27 @@ import fitz  # PyMuPDF，用于解析PDF
 import openpyxl
 import pptx
 import xlrd
+
+
+def _clean_text(text: str) -> str:
+    """
+    对文本进行清洗，为分词和向量化做准备。
+
+    清洗步骤:
+    1. 移除非中文字符：将所有非中文字符（包括标点、数字、英文、特殊符号）替换为空格。
+    2. 标准化空白：将连续的多个空白字符（包括空格、换行、制表符）合并为单个空格。
+
+    Args:
+        text: 原始文本字符串。
+
+    Returns:
+        清洗后的文本字符串。
+    """
+    # 步骤 1: 使用正则表达式保留中文字符，其余替换为空格
+    text = re.sub(r'[^一-龥]+', ' ', text)
+    # 步骤 2: 将多个连续的空白符合并为单个空格
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
 def scan_files(root_path: str, allowed_extensions: set[str]) -> Iterator[str]:
@@ -73,7 +95,7 @@ def calculate_file_hash(file_path: str) -> str | None:
 
 def get_content_slice(file_path: str, slice_size_kb: int = 1) -> str:
     """
-    提取并返回一个文档的内容切片（开头和结尾部分）。
+    提取、清洗并返回一个文档的内容切片（开头和结尾部分）。
 
     此函数是实现文档相似度评估的关键。通过仅提取文档的首尾部分作为
     其内容的摘要，可以在不牺牲过多代表性的前提下，大幅提升后续特征
@@ -91,16 +113,18 @@ def get_content_slice(file_path: str, slice_size_kb: int = 1) -> str:
         - .ppt (旧版PowerPoint二进制格式)
 
     切片逻辑:
-        如果提取的文本总长度小于等于 `slice_size_kb * 2` KB，则返回全部内容。
-        否则，返回开头 `slice_size_kb` KB 和结尾 `slice_size_kb` KB 的内容，
-        中间用 "\n...\n" 分隔。
+        1. 提取原始文本内容。
+        2. 对原始文本进行清洗（去除非中文、标准化空白）。
+        3. 如果清洗后的文本总长度小于等于 `slice_size_kb * 2` KB (字符数)，则返回全部内容。
+        4. 否则，返回开头 `slice_size_kb` KB 和结尾 `slice_size_kb` KB 的内容，
+           中间用 "\n...\n" 分隔。
 
     Args:
         file_path: 目标文件的完整路径。
         slice_size_kb: 定义切片大小的单位（KB），默认为 1 KB。
 
     Returns:
-        提取出的文本内容切片字符串。如果文件无法解析或不受支持，则返回空字符串。
+        提取并清洗后的文本内容切片字符串。如果文件无法解析或不受支持，则返回空字符串。
     """
     norm_path = os.path.normpath(file_path)
     file_ext = os.path.splitext(norm_path)[1].lower()
@@ -164,12 +188,15 @@ def get_content_slice(file_path: str, slice_size_kb: int = 1) -> str:
         logging.error(f"无法从文件提取文本内容: {norm_path}, 错误: {e}")
         return ""
 
-    # --- 执行切片逻辑 ---
-    slice_size = slice_size_kb * 1024
-    if len(text_content) <= slice_size * 2:
-        return text_content
+    # --- 在切片前执行文本清洗 ---
+    cleaned_text = _clean_text(text_content)
 
-    head = text_content[:slice_size]
-    tail = text_content[-slice_size:]
+    # --- 对清洗后的文本执行切片逻辑 ---
+    slice_size = slice_size_kb * 1024  # 将 KB 转换为字符数
+    if len(cleaned_text) <= slice_size * 2:
+        return cleaned_text
+
+    head = cleaned_text[:slice_size]
+    tail = cleaned_text[-slice_size:]
 
     return head + "\n...\n" + tail
