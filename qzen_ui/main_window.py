@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QMessageBox, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QFileDialog, QProgressBar, QListWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QDoubleSpinBox, QTabWidget,
-    QSpinBox, QMenu
+    QSpinBox, QMenu, QPlainTextEdit
 )
 from PyQt6.QtGui import QAction, QCloseEvent, QIcon, QGuiApplication
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -129,13 +129,34 @@ class MainWindow(QMainWindow):
         self.slice_size_spinbox.setRange(1, 10)
         layout.addWidget(slice_size_label, 6, 0)
         layout.addWidget(self.slice_size_spinbox, 6, 1)
-        layout.setRowStretch(7, 1)
+
+        stopwords_label = QLabel("自定义停用词 (?):")
+        stopwords_label.setToolTip("在此输入您希望在所有文本分析中忽略的词语（如公司名、产品名），每行一个。")
+        self.custom_stopwords_input = QPlainTextEdit()
+        layout.addWidget(stopwords_label, 7, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(self.custom_stopwords_input, 7, 1, 1, 2)
+
+        self.edit_stopwords_button = QPushButton("编辑")
+        self.save_stopwords_button = QPushButton("保存并应用")
+
+        stopwords_button_layout = QHBoxLayout()
+        stopwords_button_layout.addStretch()
+        stopwords_button_layout.addWidget(self.edit_stopwords_button)
+        stopwords_button_layout.addWidget(self.save_stopwords_button)
+
+        layout.addLayout(stopwords_button_layout, 8, 1, 1, 2)
+        
+        # 设置自定义停用词区域的初始状态
+        self.custom_stopwords_input.setReadOnly(True)
+        self.save_stopwords_button.hide()
+
+        layout.setRowStretch(9, 1)
         return setup_tab
 
     def _create_processing_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        self.deduplicate_button = QPushButton("执行去重")
+        self.deduplicate_button = QPushButton("执行去重与预处理")
         self.vectorize_button = QPushButton("执行向量化")
         layout.addWidget(self.deduplicate_button)
         layout.addWidget(self.vectorize_button)
@@ -182,7 +203,7 @@ class MainWindow(QMainWindow):
         self.similarity_threshold_spinbox.setRange(0.0, 1.0)
         self.similarity_threshold_spinbox.setSingleStep(0.05)
         self.similarity_threshold_spinbox.setValue(0.85)
-        self.cluster_button = QPushButton("聚类并重命名")
+        self.cluster_button = QPushButton("相似文件按主题自动分组")
         controls_layout.addWidget(self.similarity_threshold_spinbox)
         controls_layout.addWidget(self.cluster_button)
         controls_layout.addStretch()
@@ -190,10 +211,10 @@ class MainWindow(QMainWindow):
         
         self.rename_results_table_widget = QTableWidget()
         self.rename_results_table_widget.setColumnCount(2)
-        self.rename_results_table_widget.setHorizontalHeaderLabels(["原文件名", "新文件名"])
+        self.rename_results_table_widget.setHorizontalHeaderLabels(["原文件路径", "归组后文件夹"])
         self.rename_results_table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.rename_results_table_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        layout.addWidget(QLabel("重命名结果:"))
+        layout.addWidget(QLabel("自动分组结果:"))
         layout.addWidget(self.rename_results_table_widget)
         return tab
 
@@ -233,6 +254,9 @@ class MainWindow(QMainWindow):
         # 菜单
         self.about_action.triggered.connect(self.show_about_dialog)
 
+        self.save_stopwords_button.clicked.connect(self._apply_and_save_stopwords)
+        self.edit_stopwords_button.clicked.connect(self._enter_stopwords_edit_mode)
+
         # 1. 配置
         self.db_config_button.clicked.connect(self.show_db_config_dialog)
         self.source_dir_button.clicked.connect(lambda: self._select_directory(self.source_dir_input, "选择源文件夹"))
@@ -251,13 +275,43 @@ class MainWindow(QMainWindow):
         self.results_table_widget.customContextMenuRequested.connect(self._show_context_menu)
 
         # 4. 自动整理
-        self.cluster_button.clicked.connect(self.start_clustering_and_renaming)
+        self.cluster_button.clicked.connect(self.start_topic_clustering)
         self.rename_results_table_widget.customContextMenuRequested.connect(self._show_context_menu)
 
         # 5. 关键词搜索
         self.filename_search_button.clicked.connect(self.start_filename_search)
         self.content_search_button.clicked.connect(self.start_content_search)
         self.keyword_search_results_widget.customContextMenuRequested.connect(self._show_context_menu)
+
+    def _enter_stopwords_edit_mode(self):
+        """切换到自定义停用词的编辑模式。"""
+        self.custom_stopwords_input.setReadOnly(False)
+        self.custom_stopwords_input.setStyleSheet("")  # 恢复默认外观
+        self.edit_stopwords_button.hide()
+        self.save_stopwords_button.show()
+
+    def _leave_stopwords_edit_mode(self):
+        """退出自定义停用词的编辑模式，恢复到只读状态。"""
+        self.custom_stopwords_input.setReadOnly(True)
+        self.save_stopwords_button.hide()
+        self.edit_stopwords_button.show()
+
+    def _apply_and_save_stopwords(self):
+        """保存并应用新的自定义停用词列表。"""
+        # 1. 保存配置
+        self._save_app_config()
+
+        # 2. 热更新业务逻辑核心
+        if self.orchestrator:
+            custom_stopwords_text = self.custom_stopwords_input.toPlainText()
+            custom_stopwords = [word.strip() for word in custom_stopwords_text.splitlines() if word.strip()]
+            self.orchestrator.update_stopwords(custom_stopwords)
+            QMessageBox.information(self, "成功", "自定义停用词已更新并对后续任务生效！")
+        else:
+            QMessageBox.warning(self, "提示", "自定义停用词已保存，将在您配置数据库后生效。")
+
+        # 3. 切换回只读模式
+        self._leave_stopwords_edit_mode()
 
     def show_about_dialog(self):
         QMessageBox.about(self, "关于 Qzen (千针)", "<p><b>Qzen (千针) v1.0</b></p><p>本地文档智能整理客户端。</p>")
@@ -284,6 +338,7 @@ class MainWindow(QMainWindow):
         self.keyword_input.setText(config.get("last_keyword", ""))
         self.max_features_spinbox.setValue(config.get("max_features", 5000))
         self.slice_size_spinbox.setValue(config.get("slice_size_kb", 1))
+        self.custom_stopwords_input.setPlainText(config.get("custom_stopwords", ""))
 
     def _save_app_config(self):
         config = {
@@ -294,6 +349,7 @@ class MainWindow(QMainWindow):
             "last_keyword": self.keyword_input.text(),
             "max_features": self.max_features_spinbox.value(),
             "slice_size_kb": self.slice_size_spinbox.value(),
+            "custom_stopwords": self.custom_stopwords_input.toPlainText()
         }
         config_manager.save_config(config)
 
@@ -384,10 +440,16 @@ class MainWindow(QMainWindow):
 
         db_url = dialog.get_db_url()
         self.db_handler = DatabaseHandler(db_url)
+
+        # 从UI读取自定义停用词
+        custom_stopwords_text = self.custom_stopwords_input.toPlainText()
+        custom_stopwords = [word.strip() for word in custom_stopwords_text.splitlines() if word.strip()]
+
         self.orchestrator = Orchestrator(
             db_handler=self.db_handler,
             max_features=self.max_features_spinbox.value(),
-            slice_size_kb=self.slice_size_spinbox.value()
+            slice_size_kb=self.slice_size_spinbox.value(),
+            custom_stopwords=custom_stopwords
         )
 
         try:
@@ -480,17 +542,17 @@ class MainWindow(QMainWindow):
                 self.results_table_widget.setItem(row, 1, QTableWidgetItem(f"{score:.4f}"))
         self.on_task_finished("查找相似文件完成。")
 
-    def start_clustering_and_renaming(self):
+    def start_topic_clustering(self):
         target_dir = self.target_dir_input.text()
         if not self.orchestrator or not target_dir:
             QMessageBox.warning(self, "警告", "请先配置数据库并选择目标文件夹！")
             return
-        reply = QMessageBox.question(self, "确认操作", f"这将在 '{target_dir}' 目录下创建新的文件夹并复制重命名文件...\n\n您确定要继续吗？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        reply = QMessageBox.question(self, "确认操作", f"这将在 '{target_dir}' 目录下创建以主题命名的文件夹，并复制相关文件（原始文件名不变）。\n\n您确定要继续吗？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.No:
             return
         self.rename_results_table_widget.setRowCount(0)
         self._start_task(
-            self.orchestrator.run_clustering_and_renaming,
+            self.orchestrator.run_topic_clustering,
             self.on_clustering_finished,
             target_path=target_dir,
             similarity_threshold=self.similarity_threshold_spinbox.value(),
@@ -503,8 +565,9 @@ class MainWindow(QMainWindow):
         if results:
             self.rename_results_table_widget.setRowCount(len(results))
             for row, item in enumerate(results):
-                self.rename_results_table_widget.setItem(row, 0, QTableWidgetItem(os.path.basename(item.original_file_path)))
-                self.rename_results_table_widget.setItem(row, 1, QTableWidgetItem(item.new_file_path))
+                self.rename_results_table_widget.setItem(row, 0, QTableWidgetItem(item.original_file_path))
+                new_folder_path = os.path.dirname(item.new_file_path)
+                self.rename_results_table_widget.setItem(row, 1, QTableWidgetItem(new_folder_path))
         self.on_task_finished(summary)
 
     def start_filename_search(self):
