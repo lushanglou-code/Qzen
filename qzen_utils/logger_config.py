@@ -16,13 +16,13 @@ def setup_logging() -> None:
     配置全局的根日志记录器 (root logger)。
 
     此函数执行以下操作：
-    1.  确保 `logs` 目录存在，用于存放日志文件。
-    2.  设置一个 `RotatingFileHandler`，它会自动管理日志文件的大小。
-        当日志文件达到1MB时，它会被重命名备份，并创建一个新的日志文件。
-        最多会保留5个备份文件。
-    3.  定义一个标准的日志格式，包含时间、记录器名称、日志级别和消息内容。
-    4.  使用 `logging.basicConfig` 来应用配置，将日志同时输出到
-        控制台 (StreamHandler) 和文件 (RotatingFileHandler)。
+        1.  确保 `logs` 目录存在，用于存放日志文件。
+        2.  设置一个 `RotatingFileHandler`，它会自动管理日志文件的大小。
+            当日志文件达到1MB时，它会被重命名备份，并创建一个新的日志文件。
+            最多会保留5个备份文件。
+        3.  定义一个标准的日志格式，包含时间、记录器名称、日志级别和消息内容。
+        4.  使用 `logging.basicConfig` 来应用配置，将日志同时输出到
+            控制台 (StreamHandler) 和文件 (RotatingFileHandler)。
     """
     log_dir = "logs"
     # 确保日志文件存放的目录存在
