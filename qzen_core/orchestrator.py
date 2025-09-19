@@ -355,6 +355,6 @@ class Orchestrator:
         summary = f"文件内容搜索完成！共找到并复制了 {len(matched_paths)} 个文件。"
         if skipped_files:
             summary += f" \n\n警告：有 {len(skipped_files)} 个文件因权限问题被跳过（可能已被其他程序锁定）。"
-        summary += " 仅显示前100条，完整结果已存入数据库。" if len(matched_files) > 100 else " 详情已存入数据库。"
+        summary += " 仅显示前100条，完整结果已存入数据库。" if len(matched_paths) > 100 else " 详情已存入数据库。"
         self.db_handler.update_task_summary(task_run.id, summary)
         return summary, search_results[:100]
