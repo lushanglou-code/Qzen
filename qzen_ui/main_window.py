@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Qzen 主窗口模块 (v3.0 - 终极稳定版)。
+Qzen 主窗口模块 (v3.2 - 功能完善版)。
 
-此版本根据最终用户建议，彻底移除了导致崩溃的目录树 UI，
-用一个标准的文件夹选择对话框替代，从根本上保证了 UI 的稳定性。
+此版本实现了完整的“相似文件分析”功能，包括文件选择、
+带复选框的结果展示和选择性导出。
 """
 
 from __future__ import annotations # PEP 563: Solves circular import issues with type hints.
@@ -19,11 +19,11 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QAction, QCloseEvent
 from PyQt6.QtCore import pyqtSignal
 
-# --- v3.0 架构重构: 引入Orchestrator ---
+# --- v3.2 架构引入 ---
 from qzen_core.orchestrator import Orchestrator
 from qzen_core.analysis_service import AnalysisService
 
-# --- v3.0 UI模块导入 ---
+# --- v3.2 UI模块导入 ---
 from qzen_ui.tabs.setup_tab import SetupTab
 from qzen_ui.tabs.processing_tab import ProcessingTab
 from qzen_ui.tabs.analysis_cluster_tab import AnalysisClusterTab
@@ -51,7 +51,7 @@ class MainWindow(QMainWindow):
         self.analysis_service: AnalysisService | None = None
         self.worker: Worker | None = None
 
-        self.setWindowTitle("Qzen (千针) v3.0 - 智能文档组织引擎")
+        self.setWindowTitle("Qzen (千针) v3.2 - 智能文档组织引擎")
         self.setGeometry(100, 100, 1200, 800)
 
         self._create_menus()
@@ -109,9 +109,13 @@ class MainWindow(QMainWindow):
         self.setup_tab.save_stopwords_clicked.connect(self._save_app_config)
         self.processing_tab.start_ingestion_clicked.connect(self.start_ingestion)
         
-        # v3.0 简化连接
+        # 分析与聚类标签页信号
         self.analysis_cluster_tab.run_clustering_clicked.connect(self.start_clustering)
+        self.analysis_cluster_tab.select_source_file_clicked.connect(self._select_source_file)
+        self.analysis_cluster_tab.find_similar_clicked.connect(self.find_similar_files)
+        self.analysis_cluster_tab.export_similar_clicked.connect(self.export_similar_files)
         
+        # 关键词搜索标签页信号
         self.keyword_search_tab.search_by_filename_clicked.connect(self.start_filename_search)
         self.keyword_search_tab.search_by_content_clicked.connect(self.start_content_search)
         self.keyword_search_tab.export_results_clicked.connect(self.export_search_results)
@@ -121,9 +125,8 @@ class MainWindow(QMainWindow):
         self.setup_tab.set_all_configs(config)
         self.keyword_search_tab.set_config(config)
         self.analysis_cluster_tab.similarity_threshold_spinbox.setValue(config.get("similarity_threshold", 0.85))
-        # v3.0 初始化聚类目标文件夹
         intermediate_dir = config.get("intermediate_dir", "")
-        self.analysis_cluster_tab.set_target_dir(intermediate_dir)
+        self.analysis_cluster_tab.set_cluster_target_dir(intermediate_dir)
 
     def _save_app_config(self):
         config = self.setup_tab.get_all_configs()
@@ -136,7 +139,7 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def show_about_dialog(self):
-        QMessageBox.about(self, "关于 Qzen (千针)", "<p><b>Qzen (千针) v3.0</b></p><p>智能文档组织引擎。</p>")
+        QMessageBox.about(self, "关于 Qzen (千针)", "<p><b>Qzen (千针) v3.2</b></p><p>智能文档组织引擎。</p>")
 
     def _update_tab_states(self):
         is_db_configured = self.orchestrator is not None
@@ -148,14 +151,12 @@ class MainWindow(QMainWindow):
         directory = QFileDialog.getExistingDirectory(self, caption)
         if directory:
             tab.set_path_text(line_edit_name, directory)
-            # v3.0 如果更新的是中间文件夹，则自动更新聚类目标文件夹
             if line_edit_name == "intermediate_dir_input":
-                self.analysis_cluster_tab.set_target_dir(directory)
+                self.analysis_cluster_tab.set_cluster_target_dir(directory)
 
     def show_db_config_dialog(self):
         dialog = ConfigDialog(self)
-        if not dialog.exec():
-            return
+        if not dialog.exec(): return
 
         db_url = dialog.get_db_url()
         config = self.setup_tab.get_all_configs()
@@ -170,7 +171,7 @@ class MainWindow(QMainWindow):
                 slice_size_kb=config.get("slice_size_kb", 1024),
                 custom_stopwords=config['custom_stopwords'].splitlines()
             )
-            self.analysis_service = AnalysisService(self.db_handler, self.orchestrator.similarity_engine)
+            self.analysis_service = AnalysisService(self.db_handler, self.orchestrator)
 
             QMessageBox.information(self, "成功", "数据库连接成功，所有服务已准备就绪！")
         except Exception as e:
@@ -181,38 +182,23 @@ class MainWindow(QMainWindow):
         finally:
             self._update_tab_states()
 
+    # --- 阶段二：数据摄取 ---
     def start_ingestion(self):
-        if not self.orchestrator:
-            QMessageBox.warning(self, "警告", "请先在“配置”中成功连接数据库！")
-            return
-
+        if not self.orchestrator: return
         configs = self.setup_tab.get_all_configs()
-        source_dir = configs["source_dir"]
-        intermediate_dir = configs["intermediate_dir"]
-        allowed_extensions = {ext.strip() for ext in configs.get("allowed_extensions", ".pdf,.docx,.txt").split(',') if ext.strip()}
-
+        source_dir, intermediate_dir = configs["source_dir"], configs["intermediate_dir"]
         if not all([source_dir, intermediate_dir]):
             QMessageBox.warning(self, "警告", "请选择源文件夹和中间文件夹！")
             return
 
-        reply = QMessageBox.question(self, "确认操作",
-            f"此操作将彻底清空并重建数据库，同时清空中间文件夹 '{intermediate_dir}'。\n\n" \
-            f"这是一个不可逆的初始化操作，您确定要开始吗？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        reply = QMessageBox.question(self, "确认操作", f"此操作将清空数据库和中间文件夹 '{intermediate_dir}'。\n确定要开始吗？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.No: return
 
         self.processing_tab.clear_results()
         try:
             self.orchestrator.prepare_deduplication_workspace(intermediate_dir)
-            self.processing_tab.append_result("工作空间已清空并准备就绪。")
-
-            self._start_task(
-                self.orchestrator.run_deduplication_core,
-                self.on_deduplication_finished,
-                source_path=source_dir,
-                intermediate_path=intermediate_dir,
-                allowed_extensions=allowed_extensions
-            )
+            self.processing_tab.append_result("工作空间已准备就绪。")
+            self._start_task(self.orchestrator.run_deduplication_core, self.on_deduplication_finished, source_path=source_dir, intermediate_path=intermediate_dir, allowed_extensions={ext.strip() for ext in configs.get("allowed_extensions", ".pdf,.docx,.txt").split(',') if ext.strip()})
         except Exception as e:
             self.on_task_error(e)
 
@@ -220,41 +206,30 @@ class MainWindow(QMainWindow):
         summary, _ = result
         self.processing_tab.append_result(summary)
         self.processing_tab.append_result("去重完成，现在开始向量化...")
-
-        self._start_task(
-            self.orchestrator.run_vectorization,
-            self.on_vectorization_finished
-        )
+        self._start_task(self.orchestrator.run_vectorization, self.on_vectorization_finished)
 
     def on_vectorization_finished(self, summary: str):
         self.processing_tab.append_result(summary)
-        # v3.0 移除自动刷新
-        self.on_task_finished("数据摄取流程成功完成！您现在可以前往“分析与聚类”标签页开始整理文件。")
+        self.on_task_finished("数据摄取流程成功完成！")
 
+    # --- 阶段三：聚类 ---
     def start_clustering(self, target_dir: str, k: int, threshold: float):
-        if not self.orchestrator:
-            QMessageBox.warning(self, "警告", "服务尚未初始化，请先配置数据库。")
-            return
-
-        reply = QMessageBox.question(self, "确认聚类", f"确定要对文件夹 '{os.path.basename(target_dir)}' 及其内部所有文件执行 K-Means (K={k}) 和相似度聚类吗？\n此操作将移动文件夹内的文件。", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if not self.orchestrator: return
+        reply = QMessageBox.question(self, "确认聚类", f"确定要对文件夹 '{os.path.basename(target_dir)}' 执行聚类吗？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.No: return
-        
-        self._start_task(
-            self.orchestrator.run_iterative_clustering, 
-            self.on_clustering_finished, 
-            target_dir=target_dir, 
-            k=k, 
-            similarity_threshold=threshold
-        )
+        self._start_task(self.orchestrator.run_iterative_clustering, self.on_clustering_finished, target_dir=target_dir, k=k, similarity_threshold=threshold)
 
     def on_clustering_finished(self, summary: str):
         final_message = f"本轮聚类已成功完成！\n{summary}\n\n您现在可以打开文件浏览器查看整理好的文件夹。"
         self.on_task_finished(final_message)
 
+    # --- 阶段四：关键词搜索 ---
     def start_filename_search(self, keyword: str):
+        if not self.analysis_service: return
         self._start_task(self.analysis_service.search_by_filename, self.on_search_finished, keyword=keyword)
 
     def start_content_search(self, keyword: str):
+        if not self.analysis_service: return
         self._start_task(self.analysis_service.search_by_content, self.on_search_finished, keyword=keyword)
 
     def on_search_finished(self, results: List[Document]):
@@ -262,13 +237,48 @@ class MainWindow(QMainWindow):
         self.on_task_finished(f"关键词搜索完成，共找到 {len(results)} 个结果。")
 
     def export_search_results(self, doc_ids: List[int], keyword: str):
+        if not self.analysis_service: return
         target_dir = self.setup_tab.get_all_configs()["target_dir"]
         if not target_dir:
             QMessageBox.warning(self, "警告", "请先在“配置”中指定目标文件夹！")
             return
         self._start_task(self.analysis_service.export_search_results, self.on_export_finished, doc_ids=doc_ids, keyword=keyword, export_base_dir=target_dir)
 
+    # --- 阶段五：相似文件分析 ---
+    def _select_source_file(self):
+        if not self.db_handler: return
+        intermediate_dir = self.setup_tab.get_all_configs().get("intermediate_dir", "")
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择源文件", intermediate_dir, "All Files (*)")
+        if not file_path: return
+
+        doc = self.db_handler.get_document_by_path(file_path)
+        if doc:
+            self.analysis_cluster_tab.set_source_file(doc.file_path, doc.id)
+        else:
+            QMessageBox.warning(self, "错误", "无法在数据库中找到该文件的记录。\n请确保该文件位于中间文件夹内，且数据摄取已完成。")
+
+    def find_similar_files(self, source_file_id: int, top_n: int):
+        if not self.analysis_service: return
+        self._start_task(self.analysis_service.find_similar_to_file, self.on_find_similar_finished, file_id=source_file_id, top_n=top_n)
+
+    def on_find_similar_finished(self, results: List[Dict[str, Any]]):
+        self.analysis_cluster_tab.display_similar_results(results)
+        self.on_task_finished(f"为选中文件找到了 {len(results)} 个相似项。")
+
+    def export_similar_files(self, doc_ids: List[int], source_file_path: str):
+        if not self.analysis_service: return
+        target_dir = self.setup_tab.get_all_configs()["target_dir"]
+        if not target_dir:
+            QMessageBox.warning(self, "警告", "请先在“配置”中指定目标文件夹！")
+            return
+        
+        source_filename = os.path.splitext(os.path.basename(source_file_path))[0]
+        destination_dir = os.path.join(target_dir, f"{source_filename}_相似文件")
+        
+        self._start_task(self.analysis_service.export_files_by_ids, self.on_export_finished, doc_ids=doc_ids, destination_dir=destination_dir)
+
     def on_export_finished(self, export_path: str):
+        if not export_path: return
         self.on_task_finished(f"结果已成功导出到: {export_path}")
         try:
             os.startfile(export_path)
@@ -276,7 +286,6 @@ class MainWindow(QMainWindow):
             logging.error(f"无法自动打开导出文件夹: {e}")
 
     # --- 后台任务管理框架 ---
-
     def _start_task(self, target_function: Callable, on_result_slot: Callable, *args, **kwargs):
         self.tabs.setEnabled(False)
         self.progress_bar.setValue(0)
@@ -333,4 +342,4 @@ class MainWindow(QMainWindow):
     def update_progress(self, current_value: int, max_value: int, status_text: str):
         self.progress_bar.setMaximum(max_value)
         self.progress_bar.setValue(current_value)
-        self.setWindowTitle(f"Qzen (千针) v3.0 - {status_text}")
+        self.setWindowTitle(f"Qzen (千针) v3.2 - {status_text}")

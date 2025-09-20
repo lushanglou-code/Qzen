@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-文件聚类引擎模块 (v2.3 - 健壮版)。
+文件聚类引擎模块 (v3.0 - 增加空目录清理)。
 
 此版本通过在处理前校验数据，增加了对“脏数据”（如空的特征向量）的
-防御性，确保了聚类过程的健壮性。
+防御性，确保了聚类过程的健壮性。同时，在聚类完成后会自动清理空文件夹。
 """
 
 import logging
@@ -34,7 +34,7 @@ def _json_to_vector(json_str: str) -> csr_matrix:
 
 class ClusterEngine:
     """
-    封装了 v2.0 的多轮次聚类算法。
+    封装了 v3.0 的多轮次聚类算法。
     """
 
     def __init__(self, db_handler: DatabaseHandler, sim_engine: SimilarityEngine):
@@ -48,12 +48,11 @@ class ClusterEngine:
                        progress_callback: Callable = _noop_callback, 
                        is_cancelled_callback: Callable[[], bool] = lambda: False) -> None:
         """
-        在指定目录上执行一轮完整的“K-Means + 相似度”聚类，并支持进度与取消。
+        在指定目录上执行一轮完整的“K-Means + 相似度”聚类，并自动清理空目录。
         """
         logging.info(f"--- 开始对目录 '{target_dir}' 执行新一轮聚类 (K={k}) ---")
         try:
             docs = self._get_documents_from_db(target_dir)
-            # 初始检查，如果总文档数都小于K，则无需继续
             if len(docs) < k:
                 logging.warning(f"目录中的文档总数 ({len(docs)}) 小于 K值 ({k})，无法执行 K-Means 聚类。")
                 return
@@ -71,6 +70,10 @@ class ClusterEngine:
             
             logging.info(f"--- 目录 '{target_dir}' 的本轮聚类已完成 ---")
 
+            # v3.0 新增：聚类后自动清理空文件夹
+            if not is_cancelled_callback():
+                self._remove_empty_subdirectories(target_dir)
+
         except InterruptedError:
             logging.warning(f"聚类任务在处理目录 '{target_dir}' 时被用户取消。")
         except Exception as e:
@@ -87,7 +90,6 @@ class ClusterEngine:
         """
         执行 K-Means 聚类并移动文件，支持进度与取消。
         """
-        # 修正: 增加数据校验，只处理包含有效特征向量的文档
         valid_docs = [doc for doc in docs if doc.feature_vector]
         if len(valid_docs) < len(docs):
             logging.warning(f"在 K-Means 宏观分类中，跳过了 {len(docs) - len(valid_docs)} 个没有有效特征向量的文档。")
@@ -134,7 +136,6 @@ class ClusterEngine:
         docs = self._get_documents_from_db(folder_path)
         if len(docs) <= 1: return
 
-        # 修正: 增加数据校验，只处理包含有效特征向量的文档
         valid_docs = [doc for doc in docs if doc.feature_vector]
         if len(valid_docs) < len(docs):
             logging.warning(f"在相似文件微观分组中，跳过了 {len(docs) - len(valid_docs)} 个没有有效特征向量的文档。")
@@ -196,3 +197,23 @@ class ClusterEngine:
         except Exception as e:
             logging.error(f"提取主题关键词时出错: {e}")
             return ""
+
+    def _remove_empty_subdirectories(self, path: str) -> None:
+        """
+        从底向上递归删除指定路径下的所有空子文件夹。
+
+        Args:
+            path: 开始扫描的根目录。
+        """
+        logging.info(f"开始清理目录 '{path}' 下的空文件夹...")
+        removed_count = 0
+        # 从底向上遍历，这样可以先删除子目录再判断父目录是否为空
+        for dirpath, dirnames, filenames in os.walk(path, topdown=False):
+            if not dirnames and not filenames:
+                try:
+                    os.rmdir(dirpath)
+                    logging.info(f"  - 已删除空文件夹: {dirpath}")
+                    removed_count += 1
+                except OSError as e:
+                    logging.error(f"无法删除空文件夹 {dirpath}: {e}")
+        logging.info(f"空文件夹清理完成，共删除 {removed_count} 个目录。")

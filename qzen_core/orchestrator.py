@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-业务流程协调器模块。
+业务流程协调器模块 (v3.2)。
 
 定义了 Orchestrator 类，作为业务逻辑层的“总指挥”，负责协调
 数据访问层和各个业务引擎，以完成一个完整的用户请求流程。
@@ -10,7 +10,7 @@ import logging
 import os
 import json
 import shutil
-from typing import Callable, List, Tuple, Set, Dict
+from typing import Callable, List, Tuple, Set, Dict, Any
 
 import numpy as np
 from scipy.sparse import vstack, csr_matrix
@@ -45,7 +45,6 @@ class Orchestrator:
     def __init__(self, db_handler: database_handler.DatabaseHandler, max_features: int, slice_size_kb: int, custom_stopwords: List[str] = None):
         """
         初始化 Orchestrator。
-        v2.5 修正: 移除了内部的 doc_path_map 和 doc_content_map 状态。
         """
         self.db_handler = db_handler
         self.max_features = max_features
@@ -54,16 +53,12 @@ class Orchestrator:
             max_features=self.max_features,
             custom_stopwords=custom_stopwords
         )
-        # 修正: 正确地实例化 ClusterEngine，并注入其依赖
         self.cluster_engine = ClusterEngine(self.db_handler, self.similarity_engine)
         self._is_engine_primed: bool = False
 
     def update_stopwords(self, custom_stopwords: List[str]):
         """
         动态更新相似度引擎中使用的停用词列表。
-
-        Args:
-            custom_stopwords: 一个包含新的用户自定义停用词的列表。
         """
         if self.similarity_engine:
             self.similarity_engine.update_stopwords(custom_stopwords)
@@ -149,7 +144,6 @@ class Orchestrator:
     def prime_similarity_engine(self, force_reload: bool = False, is_cancelled_callback: Callable[[], bool] = lambda: False) -> None:
         """
         预热相似度引擎，加载所有文档的向量和元数据到 SimilarityEngine。
-        v2.5 修正: 将状态管理（doc_map）移至 SimilarityEngine。
         """
         if self._is_engine_primed and not force_reload:
             return
@@ -187,10 +181,10 @@ class Orchestrator:
 
         self._is_engine_primed = True
 
-    def find_top_n_similar_for_file(self, target_file_id: int, n: int, is_cancelled_callback: Callable[[], bool] = lambda: False) -> List[Tuple[int, float]]:
+    def find_top_n_similar_for_file(self, target_file_id: int, n: int, is_cancelled_callback: Callable[[], bool] = lambda: False) -> List[Dict[str, Any]]:
         """
         为指定文件 ID 查找最相似的 N 个其他文件。
-        v2.5 修正: 使用 SimilarityEngine 的 doc_map，并返回文档 ID。
+        v3.2 修正: 返回一个包含 id, path 和 score 的字典列表。
         """
         self.prime_similarity_engine(is_cancelled_callback=is_cancelled_callback)
         if is_cancelled_callback() or not self._is_engine_primed or self.similarity_engine.feature_matrix is None:
@@ -198,7 +192,6 @@ class Orchestrator:
 
         doc_map = self.similarity_engine.doc_map
         try:
-            # 从 doc_map 找到目标文件 ID 对应的索引
             target_index = next(i for i, doc in enumerate(doc_map) if doc['id'] == target_file_id)
         except StopIteration:
             logging.warning(f"无法在预热的文档映射中找到文件 ID: {target_file_id}。")
@@ -207,31 +200,22 @@ class Orchestrator:
         target_vector = self.similarity_engine.feature_matrix[target_index]
         indices, scores = self.similarity_engine.find_top_n_similar(target_vector, n=n)
         
-        # 从返回的索引中获取对应的文档 ID
-        return [(doc_map[i]['id'], score) for i, score in zip(indices, scores)]
+        return [
+            {
+                'id': doc_map[i]['id'], 
+                'path': doc_map[i]['file_path'], 
+                'score': score
+            } for i, score in zip(indices, scores)
+        ]
 
     def run_iterative_clustering(self, target_dir: str, k: int, similarity_threshold: float,
                                  progress_callback: Callable,
                                  is_cancelled_callback: Callable[[], bool] = lambda: False) -> str:
         """
         在指定目录上执行一轮完整的“K-Means + 相似度”聚类。
-
-        这是一个高级接口，它将调用底层的 ClusterEngine 来执行实际的
-        文件移动和数据库更新操作。
-
-        Args:
-            target_dir: 执行聚类的目标目录。
-            k: K-Means 算法的簇数量。
-            similarity_threshold: 微观分组时使用的相似度阈值。
-            progress_callback: 用于更新 UI 的进度回调函数。
-            is_cancelled_callback: 用于检查任务是否被用户取消的回调函数。
-
-        Returns:
-            一个表示任务结果的摘要字符串。
         """
         logging.info(f"Orchestrator 收到对目录 '{target_dir}' 的聚类请求。")
         
-        # 预热引擎，确保向量和模型已加载
         self.prime_similarity_engine(is_cancelled_callback=is_cancelled_callback)
         if is_cancelled_callback():
             return "任务已取消"
@@ -240,10 +224,8 @@ class Orchestrator:
             return "没有可供聚类的文档。"
 
         try:
-            # 创建任务记录
             task_run = self.db_handler.create_task_run(task_type='iterative_clustering')
             
-            # 调用正确的聚类引擎
             self.cluster_engine.run_clustering(
                 target_dir=target_dir,
                 k=k,
@@ -263,7 +245,6 @@ class Orchestrator:
 
         except Exception as e:
             logging.error(f"在执行迭代聚类时发生意外错误: {e}", exc_info=True)
-            # 可以在这里更新任务状态为失败
             return f"聚类失败: {e}"
 
     def run_filename_search(self, keyword: str, intermediate_path: str, target_path: str, allowed_extensions: Set[str], progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> Tuple[str, List[SearchResult]]:
@@ -302,8 +283,6 @@ class Orchestrator:
     def run_content_search(self, keyword: str, target_path: str, progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> Tuple[str, List[SearchResult]]:
         """
         在所有文档的预存内容切片中搜索关键词。
-
-        此方法直接从数据库读取 `content_slice` 进行匹配，避免了重复的文件读取和解析。
         """
         task_run = self.db_handler.create_task_run(task_type='content_search')
         all_docs = self.db_handler.get_all_documents()

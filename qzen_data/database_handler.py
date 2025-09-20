@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-数据库操作模块 (v2.5 - DM8 兼容性修复)。
+数据库操作模块 (v3.2 - 新增按路径查询)。
 
 此版本根据 mcp.json 中的 DB_WRITE_CONSTRAINT 技术强制规定，
 将 session.commit() 移入循环内部，强制逐一提交，彻底禁用批量操作，
@@ -10,6 +10,7 @@
 import datetime
 from contextlib import contextmanager
 import logging
+import os
 from typing import Generator, List, Optional
 
 from sqlalchemy import create_engine, NullPool, StaticPool
@@ -124,6 +125,14 @@ class DatabaseHandler:
         with self.get_session() as session:
             return session.get(Document, doc_id)
 
+    def get_document_by_path(self, file_path: str) -> Optional[Document]:
+        """
+        v3.2 新增: 获取指定绝对路径的单个 Document 记录。
+        """
+        normalized_path = os.path.normpath(file_path)
+        with self.get_session() as session:
+            return session.query(Document).filter(Document.file_path == normalized_path).first()
+
     def get_documents_by_ids(self, doc_ids: List[int]) -> List[Document]:
         """获取指定 id 列表的多个 Document 记录。"""
         if not doc_ids:
@@ -141,7 +150,6 @@ class DatabaseHandler:
     def get_documents_without_vectors(self) -> List[Document]:
         """
         获取所有尚未计算特征向量的 `Document` 记录。
-        v2.5 修正: 移除对空字符串的比较，以兼容 DM8 数据库。
         """
         with self.get_session() as session:
             return session.query(Document).filter(Document.feature_vector.is_(None)).all()
@@ -206,7 +214,8 @@ class DatabaseHandler:
             logging.info(f"成功逐一插入 {len(results)} 条去重结果。")
 
     def bulk_insert_rename_results(self, results: List[RenameResult]) -> None:
-        """v2.4 最终修正：逐一插入并立即提交。"""
+        """
+        v2.4 最终修正：逐一插入并立即提交。"""
         with self.get_session() as session:
             for res in results:
                 session.add(res)
@@ -214,7 +223,8 @@ class DatabaseHandler:
             logging.info(f"成功逐一插入 {len(results)} 条重命名结果。")
 
     def bulk_insert_search_results(self, results: List[SearchResult]) -> None:
-        """v2.4 最终修正：逐一插入并立即提交。"""
+        """
+        v2.4 最终修正：逐一插入并立即提交。"""
         with self.get_session() as session:
             for res in results:
                 session.add(res)

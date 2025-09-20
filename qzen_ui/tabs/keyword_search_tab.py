@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-UI 模块：关键词搜索标签页 (v2.1 修正版)
+UI 模块：关键词搜索标签页 (v3.1 - 增加复选框选择)。
 
-此版本已重构，统一使用数据库自增 ID (doc_id) 作为文档的唯一标识符。
+此版本根据用户建议，将结果列表从 QListWidget 升级为 QTableWidget，
+并增加了行首复选框和“全选/全不选”功能，极大地优化了导出体验。
 """
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, 
-    QListWidget, QListWidgetItem
+    QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox
 )
 from PyQt6.QtCore import pyqtSignal, Qt
 from typing import List
@@ -18,10 +19,8 @@ class KeywordSearchTab(QWidget):
     """
     封装了“关键词搜索”标签页的所有 UI 控件和布局。
     """
-    # 定义信号
     search_by_filename_clicked = pyqtSignal(str)
     search_by_content_clicked = pyqtSignal(str)
-    # 修正: 信号现在传递一个整数列表 (doc_ids)
     export_results_clicked = pyqtSignal(list, str) # doc_ids: List[int], keyword: str
 
     def __init__(self, parent=None):
@@ -50,11 +49,21 @@ class KeywordSearchTab(QWidget):
         search_button_layout.addStretch()
         layout.addLayout(search_button_layout)
 
-        # --- 结果展示与导出区 ---
-        layout.addWidget(QLabel("搜索结果:"))
-        self.results_list = QListWidget()
-        self.results_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        layout.addWidget(self.results_list)
+        # --- 结果展示与导出区 (v3.1 重构) ---
+        results_layout = QHBoxLayout()
+        self.select_all_checkbox = QCheckBox("全选/全不选")
+        results_layout.addWidget(self.select_all_checkbox)
+        results_layout.addStretch()
+        layout.addLayout(results_layout)
+
+        self.results_table = QTableWidget()
+        self.results_table.setColumnCount(2)
+        self.results_table.setHorizontalHeaderLabels(["选择", "文件路径"])
+        self.results_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.results_table.verticalHeader().setVisible(False)
+        self.results_table.setColumnWidth(0, 50)
+        self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.results_table)
 
         self.export_button = QPushButton("导出选中结果到目标文件夹")
         layout.addWidget(self.export_button)
@@ -64,6 +73,7 @@ class KeywordSearchTab(QWidget):
         self.filename_search_button.clicked.connect(self._on_search_filename)
         self.content_search_button.clicked.connect(self._on_search_content)
         self.export_button.clicked.connect(self._on_export)
+        self.select_all_checkbox.stateChanged.connect(self._on_select_all_changed)
 
     def _on_search_filename(self):
         keyword = self.get_keyword()
@@ -76,11 +86,18 @@ class KeywordSearchTab(QWidget):
             self.search_by_content_clicked.emit(keyword)
 
     def _on_export(self):
-        # 修正: 获取并传递 doc_ids 列表
         selected_ids = self.get_selected_doc_ids()
         keyword = self.get_keyword()
         if selected_ids and keyword:
             self.export_results_clicked.emit(selected_ids, keyword)
+
+    def _on_select_all_changed(self, state: int):
+        """当“全选”复选框状态改变时，同步所有行的复选框。"""
+        check_state = Qt.CheckState(state)
+        for row in range(self.results_table.rowCount()):
+            item = self.results_table.item(row, 0)
+            if item:
+                item.setCheckState(check_state)
 
     # --- 公共接口 ---
 
@@ -89,21 +106,35 @@ class KeywordSearchTab(QWidget):
         return self.keyword_input.text().strip()
 
     def get_selected_doc_ids(self) -> List[int]:
-        """获取结果列表中所有被选中的项的文档 ID。"""
-        return [item.data(Qt.ItemDataRole.UserRole) for item in self.results_list.selectedItems()]
+        """遍历表格，获取所有被勾选的项的文档 ID。"""
+        selected_ids = []
+        for row in range(self.results_table.rowCount()):
+            checkbox_item = self.results_table.item(row, 0)
+            if checkbox_item and checkbox_item.checkState() == Qt.CheckState.Checked:
+                path_item = self.results_table.item(row, 1)
+                if path_item:
+                    selected_ids.append(path_item.data(Qt.ItemDataRole.UserRole))
+        return selected_ids
 
     def display_results(self, documents: List[Document]):
-        """在列表中显示搜索结果。"""
-        self.results_list.clear()
+        """在表格中显示搜索结果，并为每一行添加复选框。"""
+        self.results_table.setRowCount(0)
         if not documents:
-            self.results_list.addItem("没有找到匹配的结果。")
+            # 可以在这里显示一个提示，或者保持表格为空
             return
-        
-        for doc in documents:
-            # 修正: 存储 doc.id 而不是 doc.file_hash
-            item = QListWidgetItem(f"{doc.file_path} (ID: {doc.id})")
-            item.setData(Qt.ItemDataRole.UserRole, doc.id)
-            self.results_list.addItem(item)
+
+        self.results_table.setRowCount(len(documents))
+        for row, doc in enumerate(documents):
+            # 创建复选框单元格
+            checkbox_item = QTableWidgetItem()
+            checkbox_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            checkbox_item.setCheckState(Qt.CheckState.Unchecked)
+            self.results_table.setItem(row, 0, checkbox_item)
+
+            # 创建文件路径单元格
+            path_item = QTableWidgetItem(doc.file_path)
+            path_item.setData(Qt.ItemDataRole.UserRole, doc.id) # 将 doc.id 存入文件路径单元格
+            self.results_table.setItem(row, 1, path_item)
 
     def set_config(self, config: dict):
         """加载配置（例如上次的关键词）。"""
