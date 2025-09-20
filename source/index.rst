@@ -14,3 +14,4 @@
    architecture
    coding_style
    modules
+   user_manual

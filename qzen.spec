@@ -33,8 +33,13 @@ if os.path.isdir(dpi_path):
 else:
     print(f"WARNING: dpi directory not found at {dpi_path}")
 
-# 3. Collect data files from the sqlalchemy_dm package.
-datas = collect_data_files('sqlalchemy_dm')
+# 3. Collect data files.
+datas = []
+datas += collect_data_files('sqlalchemy_dm')
+
+# v3.2 修复: 明确添加 stopwords.txt 和 logo.ico
+datas.append(('stopwords.txt', '.'))
+datas.append(('logo.ico', '.'))
 
 a = Analysis(
     ['main.py'],
@@ -54,7 +59,7 @@ a = Analysis(
         'dmPython'
     ],
     hookspath=[],
-    runtime_hooks=[], # No longer need the runtime hook.
+    runtime_hooks=[],
     excludes=[],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
