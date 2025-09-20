@@ -1,127 +1,198 @@
 # -*- coding: utf-8 -*-
 """
-文件聚类引擎模块。
+文件聚类引擎模块 (v2.3 - 健壮版)。
 
-封装了将相似文档分组（聚类）的算法，以及为文件簇生成新名称的逻辑。
+此版本通过在处理前校验数据，增加了对“脏数据”（如空的特征向量）的
+防御性，确保了聚类过程的健壮性。
 """
 
+import logging
 import os
-from typing import List
+import json
+import shutil
+from collections import defaultdict
+from typing import List, Callable
 
-from scipy.sparse import csr_matrix
+import numpy as np
+from scipy.sparse import vstack, csr_matrix
+from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
 
+from qzen_data.database_handler import DatabaseHandler
+from qzen_data.models import Document
+from qzen_core.similarity_engine import SimilarityEngine
 
-def find_longest_common_prefix(strs: List[str]) -> str:
-    """
-    查找一组字符串的“智能”最长公共前缀。
+# 定义一个无操作的回调函数作为默认值
+def _noop_callback(*args, **kwargs):
+    pass
 
-    此函数不仅查找字符上的最长公共前缀，还包含一个重要的业务逻辑：
-    为了生成更具可读性的簇名称，它会避免在单词中间截断。当找到
-    第一个不匹配的字符时，它会从不匹配点向前回溯，找到最后一个
-    词语分隔符（如空格, _, -），并返回到该分隔符为止的前缀。
-
-    Args:
-        strs: 一个包含待比较字符串的列表。
-
-    Returns:
-        计算出的最长公共前缀字符串。
-
-    Example:
-        >>> find_longest_common_prefix([
-        ...     "Qzen 项目 - 需求文档 v1.docx",
-        ...     "Qzen 项目 - 技术架构.docx",
-        ...     "Qzen 项目 - 会议纪要.docx"
-        ... ])
-        'Qzen 项目 - ' # 返回到最后一个分隔符，而不是 'Qzen 项目 - '
-    """
-    if not strs:
-        return ""
-
-    # 以最短的字符串作为基准，因为前缀不可能比它更长
-    shortest_str = min(strs, key=len)
-    
-    for i, char in enumerate(shortest_str):
-        for other_str in strs:
-            if other_str[i] != char:
-                # 一旦发现不匹配的字符，立即返回当前位置之前的部分
-                prefix = shortest_str[:i]
-                
-                # 为了避免切分单词，我们从当前位置向前找到最后一个分隔符
-                separators = [' ', '_', '-']
-                last_separator_pos = -1
-                for sep in separators:
-                    last_separator_pos = max(last_separator_pos, prefix.rfind(sep))
-                
-                if last_separator_pos > 0:
-                    # 如果找到了分隔符，返回到分隔符之后的位置
-                    return prefix[:last_separator_pos + 1]
-                
-                # 如果没有找到分隔符，则返回原始的公共前缀
-                return prefix
-    
-    # 如果所有字符串完全相同，或者其中一个是另一个的前缀，则最短的字符串就是最长公共前缀
-    return shortest_str
+def _json_to_vector(json_str: str) -> csr_matrix:
+    """将 JSON 字符串反序列化为稀疏矩阵 (CSR Matrix)。"""
+    data = json.loads(json_str)
+    return csr_matrix((data['data'], data['indices'], data['indptr']), shape=data['shape'])
 
 
 class ClusterEngine:
     """
-    封装了基于相似度的文档聚类算法。
-
-    此类提供将一组文档根据其内容相似度进行分组的核心功能。
+    封装了 v2.0 的多轮次聚类算法。
     """
 
-    def cluster_documents(self, feature_matrix: csr_matrix, similarity_threshold: float) -> List[List[int]]:
+    def __init__(self, db_handler: DatabaseHandler, sim_engine: SimilarityEngine):
         """
-        使用贪心算法根据相似度阈值对文档进行聚类。
-
-        算法描述:
-            1. 计算所有文档对之间的余弦相似度，得到一个相似度矩阵。
-            2. 遍历每一个尚未被聚类的文档（索引 `i`）。
-            3. 为文档 `i` 创建一个新的簇，并将 `i` 放入该簇。
-            4. 再次遍历所有其他尚未被聚类的文档（索引 `j`），如果文档 `j` 与
-               文档 `i` 的相似度大于或等于 `similarity_threshold`，则将 `j`
-               也加入到当前簇中。
-            5. **业务规则**: 只有当一个簇包含多于一个文档时，才被认为是一个
-               有效的簇，并被保留下来。
-
-        Args:
-            feature_matrix: 一个 CSR 格式的稀疏矩阵，其中每一行代表一个
-                            文档的 TF-IDF 特征向量。
-            similarity_threshold: 用于判断两个文档是否属于同一簇的相似度
-                                阈值 (范围 0.0 到 1.0)。
-
-        Returns:
-            一个列表，其中每个子列表包含属于同一个有效簇的文档的索引。
-            例如::
-
-                [[0, 5, 12], [1, 8], [2, 10, 15]]
+        初始化聚类引擎。
         """
+        self.db_handler = db_handler
+        self.sim_engine = sim_engine
+
+    def run_clustering(self, target_dir: str, k: int, similarity_threshold: float, 
+                       progress_callback: Callable = _noop_callback, 
+                       is_cancelled_callback: Callable[[], bool] = lambda: False) -> None:
+        """
+        在指定目录上执行一轮完整的“K-Means + 相似度”聚类，并支持进度与取消。
+        """
+        logging.info(f"--- 开始对目录 '{target_dir}' 执行新一轮聚类 (K={k}) ---")
+        try:
+            docs = self._get_documents_from_db(target_dir)
+            # 初始检查，如果总文档数都小于K，则无需继续
+            if len(docs) < k:
+                logging.warning(f"目录中的文档总数 ({len(docs)}) 小于 K值 ({k})，无法执行 K-Means 聚类。")
+                return
+
+            if is_cancelled_callback(): return
+
+            kmeans_folders = self._perform_kmeans_and_move(docs, target_dir, k, progress_callback, is_cancelled_callback)
+            if not kmeans_folders or is_cancelled_callback(): return
+
+            total_kmeans_folders = len(kmeans_folders)
+            for i, folder_path in enumerate(kmeans_folders):
+                if is_cancelled_callback(): return
+                progress_callback(i + 1, total_kmeans_folders, f"正在处理子文件夹: {os.path.basename(folder_path)}")
+                self._perform_similarity_grouping_and_move(folder_path, similarity_threshold, is_cancelled_callback)
+            
+            logging.info(f"--- 目录 '{target_dir}' 的本轮聚类已完成 ---")
+
+        except InterruptedError:
+            logging.warning(f"聚类任务在处理目录 '{target_dir}' 时被用户取消。")
+        except Exception as e:
+            logging.error(f"执行聚类时发生未知错误: {e}", exc_info=True)
+
+    def _get_documents_from_db(self, target_dir: str) -> List[Document]:
+        """从数据库中获取指定目录下的所有文档记录。"""
+        with self.db_handler.get_session() as session:
+            normalized_path = os.path.normpath(target_dir)
+            path_pattern = os.path.join(normalized_path, '') + '%'
+            return session.query(Document).filter(Document.file_path.like(path_pattern)).all()
+
+    def _perform_kmeans_and_move(self, docs: List[Document], base_dir: str, k: int, progress_callback: Callable, is_cancelled_callback: Callable[[], bool]) -> List[str]:
+        """
+        执行 K-Means 聚类并移动文件，支持进度与取消。
+        """
+        # 修正: 增加数据校验，只处理包含有效特征向量的文档
+        valid_docs = [doc for doc in docs if doc.feature_vector]
+        if len(valid_docs) < len(docs):
+            logging.warning(f"在 K-Means 宏观分类中，跳过了 {len(docs) - len(valid_docs)} 个没有有效特征向量的文档。")
+        
+        if len(valid_docs) < k:
+            logging.warning(f"过滤后，目录中的有效文档数量 ({len(valid_docs)}) 小于 K值 ({k})，无法执行 K-Means 聚类。")
+            return []
+
+        feature_vectors = [_json_to_vector(doc.feature_vector) for doc in valid_docs]
+        feature_matrix = vstack(feature_vectors)
+
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        kmeans.fit(feature_matrix)
+        labels = kmeans.labels_
+
+        clustered_docs = defaultdict(list)
+        for doc, label in zip(valid_docs, labels):
+            clustered_docs[label].append(doc)
+
+        created_folders, docs_to_update = [], []
+        total_clusters = len(clustered_docs)
+        for i, (label, doc_list) in enumerate(clustered_docs.items()):
+            if is_cancelled_callback(): raise InterruptedError("任务已取消")
+            progress_callback(i + 1, total_clusters, f"K-Means 分类: 正在移动第 {i+1} 簇")
+
+            new_folder_path = os.path.normpath(os.path.join(base_dir, str(label)))
+            os.makedirs(new_folder_path, exist_ok=True)
+            created_folders.append(new_folder_path)
+
+            for doc in doc_list:
+                original_path = doc.file_path
+                new_path = os.path.normpath(os.path.join(new_folder_path, os.path.basename(original_path)))
+                doc.file_path = new_path
+                docs_to_update.append(doc)
+                shutil.move(original_path, new_path)
+        
+        if docs_to_update: self.db_handler.bulk_update_documents(docs_to_update)
+        return created_folders
+
+    def _perform_similarity_grouping_and_move(self, folder_path: str, threshold: float, is_cancelled_callback: Callable[[], bool]) -> None:
+        """
+        在单个文件夹内执行相似度分组，支持取消。
+        """
+        docs = self._get_documents_from_db(folder_path)
+        if len(docs) <= 1: return
+
+        # 修正: 增加数据校验，只处理包含有效特征向量的文档
+        valid_docs = [doc for doc in docs if doc.feature_vector]
+        if len(valid_docs) < len(docs):
+            logging.warning(f"在相似文件微观分组中，跳过了 {len(docs) - len(valid_docs)} 个没有有效特征向量的文档。")
+
+        if len(valid_docs) <= 1: return
+
+        feature_vectors = [_json_to_vector(doc.feature_vector) for doc in valid_docs]
+        feature_matrix = vstack(feature_vectors)
+        content_slices = [doc.content_slice for doc in valid_docs]
+
+        clusters_indices = self._cluster_documents_by_similarity(feature_matrix, threshold)
+        if not clusters_indices: return
+
+        docs_to_update = []
+        for cluster in clusters_indices:
+            if is_cancelled_callback(): raise InterruptedError("任务已取消")
+            cluster_docs = [valid_docs[i] for i in cluster]
+            cluster_content = [content_slices[i] for i in cluster]
+
+            topic_name = self._extract_topic_keywords(cluster_content) or "相似文件簇"
+            topic_folder_path = os.path.normpath(os.path.join(folder_path, topic_name))
+            os.makedirs(topic_folder_path, exist_ok=True)
+
+            for doc in cluster_docs:
+                original_path = doc.file_path
+                new_path = os.path.normpath(os.path.join(topic_folder_path, os.path.basename(original_path)))
+                doc.file_path = new_path
+                docs_to_update.append(doc)
+                shutil.move(original_path, new_path)
+
+        if docs_to_update: self.db_handler.bulk_update_documents(docs_to_update)
+
+    def _cluster_documents_by_similarity(self, feature_matrix: csr_matrix, similarity_threshold: float) -> List[List[int]]:
         num_docs = feature_matrix.shape[0]
-        # 预先计算所有文档之间的两两相似度，这是一个 N x N 的矩阵
         sim_matrix = cosine_similarity(feature_matrix)
-
-        # 使用一个布尔列表来跟踪哪些文档已经被分配到簇中
         clustered = [False] * num_docs
         clusters = []
-
         for i in range(num_docs):
-            # 如果当前文档已经被分配过，则跳过
-            if clustered[i]:
-                continue
-
-            # 为当前文档创建一个新簇，它自己是第一个成员
+            if clustered[i]: continue
             current_cluster = [i]
             clustered[i] = True
-
-            # 贪心步骤：遍历其他所有文档，看是否能将它们吸纳进当前簇
             for j in range(i + 1, num_docs):
                 if not clustered[j] and sim_matrix[i, j] >= similarity_threshold:
                     current_cluster.append(j)
                     clustered[j] = True
-            
-            # 业务规则：只有当簇中包含多个文件时，才认为它是一个有意义的簇
             if len(current_cluster) > 1:
                 clusters.append(current_cluster)
-
         return clusters
+
+    def _extract_topic_keywords(self, content_list: List[str], top_n: int = 3) -> str:
+        if not content_list: return ""
+        try:
+            tfidf_matrix = self.sim_engine.vectorizer.transform(content_list)
+            summed_tfidf = np.array(tfidf_matrix.sum(axis=0)).flatten()
+            feature_names = np.array(self.sim_engine.vectorizer.get_feature_names_out())
+            top_indices = summed_tfidf.argsort()[-top_n:][::-1]
+            keywords = [feature_names[i] for i in top_indices]
+            return "_".join(keywords)
+        except Exception as e:
+            logging.error(f"提取主题关键词时出错: {e}")
+            return ""

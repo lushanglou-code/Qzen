@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-表现层 (UI) 包。包含所有与用户界面相关的窗口、控件和视图。
-"""
+表现层 (UI) 包。
 
-# 导入模块以使其能被 autosummary 发现
-from . import config_dialog
-from . import main_window
-from . import worker
+包含所有与用户界面相关的窗口、控件和视图。
+此 __init__.py 文件在 v2.0 重构后被有意留空，以避免因
+为了文档生成而导入子模块，从而引发的循环导入问题。
+"""

@@ -1,0 +1,115 @@
+# -*- coding: utf-8 -*-
+"""
+数据库驱动行为的真实集成测试。
+
+此测试文件不使用任何模拟（Mock），它直接连接到真实的DM8数据库，
+旨在精确地、可重复地证明和验证 `sqlalchemy-dm` 驱动在不同写入
+场景下的行为，特别是与 SQLAlchemy 工作单元（Unit of Work）的交互。
+
+这些测试的通过与否，将成为我们制定数据库操作策略的最终依据。
+"""
+
+import pytest
+import logging
+
+from sqlalchemy.exc import DBAPIError
+
+from qzen_data.database_handler import DatabaseHandler
+from qzen_data.models import Document
+
+# --- 测试配置 ---
+# 修正: 使用用户提供的、包含正确大小写和凭据的数据库连接字符串
+DATABASE_URL = "dm+dmPython://GIMI:DM8DM8DM8@127.0.0.1:5236"
+
+@pytest.fixture(scope="module")
+def db_handler():
+    """提供一个模块级别的、持久的 DatabaseHandler 实例。"""
+    handler = DatabaseHandler(DATABASE_URL)
+    return handler
+
+@pytest.fixture(autouse=True)
+def setup_and_teardown_table(db_handler: DatabaseHandler):
+    """在每个测试函数运行前后，自动清理和重建 `documents` 表。"""
+    logging.info("--- (Test Setup) Recreating tables for a clean slate ---")
+    db_handler.recreate_tables()
+    yield
+    logging.info("--- (Test Teardown) Cleaning up tables ---")
+    db_handler.recreate_tables()
+
+
+def test_single_record_commit_succeeds(db_handler: DatabaseHandler):
+    """
+    基准测试：验证最简单的单条记录插入和提交是成功的。
+    """
+    with db_handler.get_session() as session:
+        doc = Document(file_hash="single_hash", file_path="/path/single.txt", content_slice="", feature_vector="")
+        session.add(doc)
+        session.commit()
+    # 如果没有异常抛出，则测试通过
+    assert True
+
+
+def test_batch_update_with_single_commit_fails(db_handler: DatabaseHandler):
+    """
+    验证缺陷：证明即使在 Python 层循环，但在循环外单次 commit，
+    依然会触发驱动的批量操作 Bug。
+    """
+    # 1. 先插入一条记录以便后续更新
+    with db_handler.get_session() as session:
+        doc1 = Document(file_hash="update_test_1", file_path="/path/update1.txt", content_slice="", feature_vector="")
+        doc2 = Document(file_hash="update_test_2", file_path="/path/update2.txt", content_slice="", feature_vector="")
+        session.add_all([doc1, doc2])
+        session.commit()
+        doc1_id, doc2_id = doc1.id, doc2.id
+
+    # 2. 获取这些记录，修改它们，然后尝试一次性提交更新
+    with pytest.raises(DBAPIError) as excinfo:
+        with db_handler.get_session() as session:
+            retrieved_doc1 = session.get(Document, doc1_id)
+            retrieved_doc2 = session.get(Document, doc2_id)
+            retrieved_doc1.content_slice = "updated_1"
+            retrieved_doc2.content_slice = "updated_2"
+            # 核心：在循环外提交，这将触发 SQLAlchemy 的工作单元进行批量 UPDATE
+            session.commit()
+    
+    # 3. 断言我们捕获到了正确的、由驱动缺陷导致的错误
+    assert "cannot access local variable 'str_result'" in str(excinfo.value.orig)
+    logging.info(f"\nSUCCESS: Correctly captured the expected driver bug during batch UPDATE: {excinfo.value.orig}")
+
+
+def test_batch_insert_with_single_commit_fails(db_handler: DatabaseHandler):
+    """
+    验证缺陷：证明 `add_all` 配合循环外的单次 commit，会触发驱动的 Bug。
+    """
+    docs_to_add = [
+        Document(file_hash="batch_insert_1", file_path="/path/batch1.txt", content_slice="", feature_vector=""),
+        Document(file_hash="batch_insert_2", file_path="/path/batch2.txt", content_slice="", feature_vector="")
+    ]
+    with pytest.raises(DBAPIError) as excinfo:
+        with db_handler.get_session() as session:
+            session.add_all(docs_to_add)
+            # 核心：在添加多条记录后一次性提交，这将触发批量 INSERT
+            session.commit()
+
+    assert "cannot access local variable 'str_result'" in str(excinfo.value.orig)
+    logging.info(f"\nSUCCESS: Correctly captured the expected driver bug during batch INSERT: {excinfo.value.orig}")
+
+
+def test_commit_in_loop_succeeds(db_handler: DatabaseHandler):
+    """
+    验证修复方案：证明在循环内部为每一条记录都单独 commit，可以成功绕过驱动 Bug。
+    """
+    docs_to_add = [
+        Document(file_hash="loop_commit_1", file_path="/path/loop1.txt", content_slice="", feature_vector=""),
+        Document(file_hash="loop_commit_2", file_path="/path/loop2.txt", content_slice="", feature_vector="")
+    ]
+    try:
+        with db_handler.get_session() as session:
+            for doc in docs_to_add:
+                session.add(doc)
+                # 核心：在循环内部提交，强制逐一写入
+                session.commit()
+        # 如果没有异常抛出，则测试通过
+        assert True
+    except Exception as e:
+        pytest.fail(f"Commit-in-loop strategy failed unexpectedly: {e}")

@@ -17,7 +17,7 @@ from scipy.sparse import vstack, csr_matrix
 from sklearn.exceptions import NotFittedError
 
 from qzen_data import file_handler, database_handler
-from qzen_data.models import Document, DeduplicationResult, RenameResult, SearchResult
+from qzen_data.models import Document, DeduplicationResult, SearchResult
 from qzen_core.similarity_engine import SimilarityEngine
 from qzen_core.cluster_engine import ClusterEngine
 
@@ -45,6 +45,7 @@ class Orchestrator:
     def __init__(self, db_handler: database_handler.DatabaseHandler, max_features: int, slice_size_kb: int, custom_stopwords: List[str] = None):
         """
         初始化 Orchestrator。
+        v2.5 修正: 移除了内部的 doc_path_map 和 doc_content_map 状态。
         """
         self.db_handler = db_handler
         self.max_features = max_features
@@ -53,10 +54,9 @@ class Orchestrator:
             max_features=self.max_features,
             custom_stopwords=custom_stopwords
         )
-        self.cluster_engine = ClusterEngine()
+        # 修正: 正确地实例化 ClusterEngine，并注入其依赖
+        self.cluster_engine = ClusterEngine(self.db_handler, self.similarity_engine)
         self._is_engine_primed: bool = False
-        self._doc_path_map: List[str] = []
-        self._doc_content_map: Dict[str, str] = {}
 
     def update_stopwords(self, custom_stopwords: List[str]):
         """
@@ -148,136 +148,123 @@ class Orchestrator:
 
     def prime_similarity_engine(self, force_reload: bool = False, is_cancelled_callback: Callable[[], bool] = lambda: False) -> None:
         """
-        预热相似度引擎。
+        预热相似度引擎，加载所有文档的向量和元数据到 SimilarityEngine。
+        v2.5 修正: 将状态管理（doc_map）移至 SimilarityEngine。
         """
         if self._is_engine_primed and not force_reload:
             return
+        
+        logging.info("正在预热相似度引擎...")
         all_docs = self.db_handler.get_all_documents()
-        self._doc_content_map = {doc.file_path: (doc.content_slice or "") for doc in all_docs}
         docs_with_vectors = [doc for doc in all_docs if doc.feature_vector]
+
         if not docs_with_vectors:
             self.similarity_engine.feature_matrix = None
-            self._doc_path_map = []
+            self.similarity_engine.doc_map = []
             self._is_engine_primed = True
+            logging.info("引擎预热完成，但未找到任何已向量化的文档。")
             return
 
-        vectors, doc_paths = [], []
+        vectors, doc_map = [], []
         for doc in docs_with_vectors:
-            if is_cancelled_callback(): return
+            if is_cancelled_callback():
+                logging.info("引擎预热被用户取消。")
+                return
             try:
                 vectors.append(_json_to_vector(doc.feature_vector))
-                doc_paths.append(doc.file_path)
+                doc_map.append({'id': doc.id, 'file_path': doc.file_path})
             except (json.JSONDecodeError, KeyError) as e:
                 logging.error(f"无法解析文件 '{doc.file_path}' 的特征向量JSON。将跳过此文件。错误: {e}")
 
         if vectors:
             self.similarity_engine.feature_matrix = vstack(vectors)
+            self.similarity_engine.doc_map = doc_map
+            logging.info(f"引擎预热成功，已加载 {len(doc_map)} 个文档的向量和映射。")
         else:
             self.similarity_engine.feature_matrix = None
-        self._doc_path_map = doc_paths
+            self.similarity_engine.doc_map = []
+            logging.info("引擎预热完成，但未能成功加载任何向量。")
+
         self._is_engine_primed = True
 
-    def find_top_n_similar_for_file(self, target_file_path: str, n: int, is_cancelled_callback: Callable[[], bool] = lambda: False) -> List[Tuple[str, float]]:
-        """为指定文件查找最相似的 N 个其他文件。"""
+    def find_top_n_similar_for_file(self, target_file_id: int, n: int, is_cancelled_callback: Callable[[], bool] = lambda: False) -> List[Tuple[int, float]]:
+        """
+        为指定文件 ID 查找最相似的 N 个其他文件。
+        v2.5 修正: 使用 SimilarityEngine 的 doc_map，并返回文档 ID。
+        """
         self.prime_similarity_engine(is_cancelled_callback=is_cancelled_callback)
         if is_cancelled_callback() or not self._is_engine_primed or self.similarity_engine.feature_matrix is None:
             return []
+
+        doc_map = self.similarity_engine.doc_map
         try:
-            target_index = self._doc_path_map.index(os.path.normpath(target_file_path))
-        except ValueError:
+            # 从 doc_map 找到目标文件 ID 对应的索引
+            target_index = next(i for i, doc in enumerate(doc_map) if doc['id'] == target_file_id)
+        except StopIteration:
+            logging.warning(f"无法在预热的文档映射中找到文件 ID: {target_file_id}。")
             return []
+
         target_vector = self.similarity_engine.feature_matrix[target_index]
         indices, scores = self.similarity_engine.find_top_n_similar(target_vector, n=n)
-        return [(self._doc_path_map[i], score) for i, score in zip(indices, scores)]
+        
+        # 从返回的索引中获取对应的文档 ID
+        return [(doc_map[i]['id'], score) for i, score in zip(indices, scores)]
 
-    def run_topic_clustering(self, target_path: str, similarity_threshold: float, progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> Tuple[str, List[RenameResult]]:
+    def run_iterative_clustering(self, target_dir: str, k: int, similarity_threshold: float,
+                                 progress_callback: Callable,
+                                 is_cancelled_callback: Callable[[], bool] = lambda: False) -> str:
         """
-        对所有文档进行自动聚类，并根据簇的主题词创建文件夹进行分组。
-        采用基于向量平均值的安全算法，以避免内存崩溃。
+        在指定目录上执行一轮完整的“K-Means + 相似度”聚类。
+
+        这是一个高级接口，它将调用底层的 ClusterEngine 来执行实际的
+        文件移动和数据库更新操作。
+
+        Args:
+            target_dir: 执行聚类的目标目录。
+            k: K-Means 算法的簇数量。
+            similarity_threshold: 微观分组时使用的相似度阈值。
+            progress_callback: 用于更新 UI 的进度回调函数。
+            is_cancelled_callback: 用于检查任务是否被用户取消的回调函数。
+
+        Returns:
+            一个表示任务结果的摘要字符串。
         """
+        logging.info(f"Orchestrator 收到对目录 '{target_dir}' 的聚类请求。")
+        
+        # 预热引擎，确保向量和模型已加载
         self.prime_similarity_engine(is_cancelled_callback=is_cancelled_callback)
-        if is_cancelled_callback() or self.similarity_engine.feature_matrix is None or self.similarity_engine.feature_matrix.shape[0] == 0:
-            return "没有可供聚类的文档。", []
+        if is_cancelled_callback():
+            return "任务已取消"
+        
+        if self.similarity_engine.feature_matrix is None or self.similarity_engine.feature_matrix.shape[0] == 0:
+            return "没有可供聚类的文档。"
 
         try:
-            global_feature_names = np.array(self.similarity_engine.vectorizer.get_feature_names_out())
-        except NotFittedError:
-            return "相似度引擎尚未训练，请先执行向量化。", []
+            # 创建任务记录
+            task_run = self.db_handler.create_task_run(task_type='iterative_clustering')
+            
+            # 调用正确的聚类引擎
+            self.cluster_engine.run_clustering(
+                target_dir=target_dir,
+                k=k,
+                similarity_threshold=similarity_threshold,
+                progress_callback=progress_callback,
+                is_cancelled_callback=is_cancelled_callback
+            )
 
-        task_run = self.db_handler.create_task_run(task_type='topic_clustering')
-        clusters = self.cluster_engine.cluster_documents(self.similarity_engine.feature_matrix, similarity_threshold)
-        
-        os.makedirs(target_path, exist_ok=True)
-        grouping_results, skipped_files = [], []
-        clustered_indices = set()
-
-        for i, cluster_indices in enumerate(clusters):
             if is_cancelled_callback():
-                logging.info("主题聚类任务被用户取消。")
-                return "任务已取消", []
-            progress_callback(i + 1, len(clusters), f"正在处理第 {i+1} 个文件簇...")
-            
-            clustered_indices.update(cluster_indices)
-            cluster_matrix = self.similarity_engine.feature_matrix[cluster_indices]
-            mean_vector = np.array(cluster_matrix.mean(axis=0)).flatten()
-            top_feature_indices = mean_vector.argsort()[::-1][:10]
-            top_keywords = [global_feature_names[idx] for idx in top_feature_indices if mean_vector[idx] > 0]
-            
-            num_keywords = min(max(1, len(top_keywords)), 5)
-            final_keywords = top_keywords[:num_keywords]
-            
-            if final_keywords:
-                cluster_name = "_".join(final_keywords)
-            else:
-                cluster_name = f"相似文件簇_{i+1}"
+                summary = "聚类任务被用户取消。"
+                self.db_handler.update_task_summary(task_run.id, summary)
+                return summary
 
-            cluster_dir = os.path.join(target_path, cluster_name)
-            os.makedirs(cluster_dir, exist_ok=True)
+            summary = f"对目录 '{os.path.basename(target_dir)}' 的迭代聚类已成功完成。"
+            self.db_handler.update_task_summary(task_run.id, summary)
+            return summary
 
-            original_paths = [self._doc_path_map[idx] for idx in cluster_indices]
-            for original_path in original_paths:
-                destination_path = os.path.join(cluster_dir, os.path.basename(original_path))
-                try:
-                    shutil.copy2(original_path, destination_path)
-                    grouping_results.append(RenameResult(task_run_id=task_run.id, original_file_path=original_path, new_file_path=destination_path))
-                except PermissionError:
-                    logging.warning(f"权限错误：无法复制文件 {original_path} 到 {destination_path}，可能文件已被锁定。将跳过此文件。")
-                    skipped_files.append(original_path)
-
-        # 处理未归类的文件
-        all_indices = set(range(self.similarity_engine.feature_matrix.shape[0]))
-        unclustered_indices = all_indices - clustered_indices
-        unclustered_count = 0
-        if unclustered_indices:
-            unclustered_dir = os.path.join(target_path, "未归类")
-            os.makedirs(unclustered_dir, exist_ok=True)
-            logging.info(f"找到 {len(unclustered_indices)} 个未归类文件，将它们复制到 '{unclustered_dir}'")
-
-            for idx in unclustered_indices:
-                if is_cancelled_callback():
-                    logging.info("主题聚类任务在处理未归类文件时被用户取消。")
-                    break
-                original_path = self._doc_path_map[idx]
-                destination_path = os.path.join(unclustered_dir, os.path.basename(original_path))
-                try:
-                    shutil.copy2(original_path, destination_path)
-                    unclustered_count += 1
-                except PermissionError:
-                    logging.warning(f"权限错误：无法复制未归类文件 {original_path} 到 {destination_path}，可能文件已被锁定。将跳过此文件。")
-                    skipped_files.append(original_path)
-
-        if grouping_results: self.db_handler.bulk_insert_rename_results(grouping_results)
-        
-        summary = f"主题聚类完成！共创建 {len(clusters)} 个主题文件夹，整理了 {len(grouping_results)} 个文件。"
-        if unclustered_count > 0:
-            summary += f" 另有 {unclustered_count} 个文件被移至“未归类”文件夹。"
-        if not clusters and unclustered_count > 0:
-             summary = f"在当前相似度阈值下，没有找到可以构成簇的相似文档。所有 {unclustered_count} 个文件已被移至“未归类”文件夹。"
-        if skipped_files:
-            summary += f" \n\n警告：有 {len(skipped_files)} 个文件因权限问题被跳过（可能已被其他程序锁定）。"
-        summary += " 仅显示前100条，完整结果已存入数据库。" if len(grouping_results) > 100 else " 详情已存入数据库。"
-        self.db_handler.update_task_summary(task_run.id, summary)
-        return summary, grouping_results[:100]
+        except Exception as e:
+            logging.error(f"在执行迭代聚类时发生意外错误: {e}", exc_info=True)
+            # 可以在这里更新任务状态为失败
+            return f"聚类失败: {e}"
 
     def run_filename_search(self, keyword: str, intermediate_path: str, target_path: str, allowed_extensions: Set[str], progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> Tuple[str, List[SearchResult]]:
         """在中间文件夹中按文件名搜索，并将结果存入数据库。"""
@@ -355,6 +342,6 @@ class Orchestrator:
         summary = f"文件内容搜索完成！共找到并复制了 {len(matched_paths)} 个文件。"
         if skipped_files:
             summary += f" \n\n警告：有 {len(skipped_files)} 个文件因权限问题被跳过（可能已被其他程序锁定）。"
-        summary += " 仅显示前100条，完整结果已存入数据库。" if len(matched_paths) > 100 else " 详情已存入数据库。"
+        summary += " 仅显示前100条，完整结果已存入数据库。" if len(matched_files) > 100 else " 详情已存入数据库。"
         self.db_handler.update_task_summary(task_run.id, summary)
         return summary, search_results[:100]

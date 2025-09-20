@@ -15,7 +15,9 @@ import docx
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+# 修正: 导入 _clean_text 以便在测试中模拟正确的行为
 from qzen_data import file_handler
+from qzen_data.file_handler import _clean_text
 
 
 class TestFileHandler(unittest.TestCase):
@@ -41,6 +43,7 @@ class TestFileHandler(unittest.TestCase):
 
         slice_content = file_handler.get_content_slice(file_path, slice_size_kb=1)
         
+        # 因为内容是纯字母，所以清洗前后一致
         expected_content = head_content + "\n...\n" + tail_content
         self.assertEqual(slice_content, expected_content)
 
@@ -52,7 +55,10 @@ class TestFileHandler(unittest.TestCase):
             f.write(content)
 
         slice_content = file_handler.get_content_slice(file_path, slice_size_kb=1)
-        self.assertEqual(slice_content, content)
+        
+        # 修正: 预期结果应该是原始文本被清洗后的结果
+        expected_content = _clean_text(content)
+        self.assertEqual(slice_content, expected_content)
 
     def test_get_content_slice_docx(self):
         """测试从 .docx 文件中提取内容切片。"""
@@ -67,10 +73,13 @@ class TestFileHandler(unittest.TestCase):
 
         slice_content = file_handler.get_content_slice(file_path, slice_size_kb=1)
         
-        # 从原始文本中提取预期的切片
-        full_text = head_content + "\n" + "This is the middle." + "\n" + tail_content + "\n"
-        expected_head = full_text[:1024]
-        expected_tail = full_text[-1024:]
+        # 修正: 对原始文本应用与函数内部完全相同的清洗和切片逻辑
+        original_full_text = head_content + "\n" + "This is the middle." + "\n" + tail_content + "\n"
+        cleaned_full_text = _clean_text(original_full_text)
+        
+        slice_size = 1 * 1024
+        expected_head = cleaned_full_text[:slice_size]
+        expected_tail = cleaned_full_text[-slice_size:]
         expected_slice = expected_head + "\n...\n" + expected_tail
 
         self.assertEqual(slice_content, expected_slice)
@@ -83,6 +92,7 @@ class TestFileHandler(unittest.TestCase):
         middle_content = "M" * 2048
         tail_content = "T" * 1024
         full_text = head_content + middle_content + tail_content
+        # 因为内容是纯字母，所以清洗前后一致
         expected_slice = head_content + "\n...\n" + tail_content
 
         # 2. 配置模拟对象的行为

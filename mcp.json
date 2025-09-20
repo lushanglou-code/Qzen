@@ -24,6 +24,13 @@
         "file": "source/modules.rst",
         "purpose": "Defines the code's documentation structure. Your work should be reflected in the auto-generated documentation."
       }
+    ],
+    "technical_mandates": [
+      {
+        "id": "DB_WRITE_CONSTRAINT",
+        "description": "Due to identified instability in the sqlalchemy-dm driver, all database write operations (INSERT, UPDATE) MUST be executed in a loop, one record at a time. Batch operations (e.g., `bulk_save_objects`, `add_all` on a list) are strictly forbidden to ensure stability.",
+        "reason": "The `sqlalchemy-dm` driver's `do_executemany` method has a bug that causes an `UnboundLocalError` when processing batch operations."
+      }
     ]
   },
   "available_tools": {

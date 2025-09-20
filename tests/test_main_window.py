@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Qzen 主窗口的UI冒烟测试。
+Qzen 主窗口的UI冒烟测试 (v2.1 修正版)。
 
-这些测试旨在确保主窗口及其所有核心UI组件能够被成功创建和初始化，
-防止在重构或未来开发中意外破坏UI布局。
+这些测试旨在确保主窗口能够成功地实例化并集成所有模块化的UI标签页，
+并且每个标签页内部的核心控件都已创建。
 """
 
 import pytest
 from PyQt6.QtWidgets import QMainWindow
 
-# 假设 pytest 是从项目根目录运行的，并且 qzen_ui 在 PYTHONPATH 中
+# 假设 pytest 是从项目根目录运行的
 from qzen_ui.main_window import MainWindow
 
 @pytest.fixture
@@ -26,71 +26,76 @@ def test_main_window_creation(app: MainWindow):
     测试: 主窗口是否能被成功创建。
     """
     assert isinstance(app, QMainWindow)
-    assert "Qzen (千针)" in app.windowTitle()
+    # 修正: 更新版本号以匹配当前的窗口标题
+    assert "Qzen (千针) v2.1" in app.windowTitle()
 
-def test_tabs_are_created(app: MainWindow):
+def test_tabs_are_created_and_named_correctly(app: MainWindow):
     """
-    测试: 所有标签页是否都已创建并添加到TabWidget中。
+    测试 (v2.0): 所有标签页是否都已创建并使用新的名称。
     """
     assert app.tabs is not None
-    assert app.tabs.count() == 5
+    assert app.tabs.count() == 4
     assert app.tabs.tabText(0) == "1. 配置"
-    assert app.tabs.tabText(1) == "2. 批量处理"
-    assert app.tabs.tabText(2) == "3. 交互式分析"
-    assert app.tabs.tabText(3) == "4. 自动整理"
-    assert app.tabs.tabText(4) == "5. 关键词搜索"
+    assert app.tabs.tabText(1) == "2. 数据摄取"
+    assert app.tabs.tabText(2) == "3. 分析与聚类"
+    assert app.tabs.tabText(3) == "4. 关键词搜索"
+
+def test_tab_instances_are_created(app: MainWindow):
+    """
+    测试 (v2.0): MainWindow 是否持有所有模块化 Tab 的实例。
+    """
+    assert app.setup_tab is not None
+    assert app.processing_tab is not None
+    assert app.analysis_cluster_tab is not None
+    assert app.keyword_search_tab is not None
 
 def test_setup_tab_widgets_exist(app: MainWindow):
     """
-    测试: “配置”标签页中的所有控件是否都已创建。
+    测试 (v2.0): “配置”标签页中的所有控件是否都已创建。
     """
-    assert app.db_config_button is not None
-    assert app.source_dir_input is not None
-    assert app.source_dir_button is not None
-    assert app.intermediate_dir_input is not None
-    assert app.intermediate_dir_button is not None
-    assert app.target_dir_input is not None
-    assert app.target_dir_button is not None
-    assert app.max_features_spinbox is not None
-    assert app.slice_size_spinbox is not None
+    tab = app.setup_tab
+    assert tab.db_config_button is not None
+    assert tab.source_dir_input is not None
+    assert tab.intermediate_dir_input is not None
+    assert tab.target_dir_input is not None
+    assert tab.max_features_spinbox is not None
+    assert tab.custom_stopwords_input is not None
 
 def test_processing_tab_widgets_exist(app: MainWindow):
     """
-    测试: “批量处理”标签页中的所有控件是否都已创建。
+    测试 (v2.0): “数据摄取”标签页中的控件是否都已创建。
     """
-    assert app.deduplicate_button is not None
-    assert app.vectorize_button is not None
-    assert app.deduplication_results_widget is not None
+    tab = app.processing_tab
+    assert tab.ingestion_button is not None
+    assert tab.results_display is not None
 
-def test_analysis_tab_widgets_exist(app: MainWindow):
+def test_analysis_cluster_tab_widgets_exist(app: MainWindow):
     """
-    测试: “交互式分析”标签页中的所有控件是否都已创建。
+    测试 (v2.0): “分析与聚类”标签页中的控件是否都已创建。
     """
-    assert app.load_files_button is not None
-    assert app.file_list_widget is not None
-    assert app.find_similar_button is not None
-    assert app.results_table_widget is not None
-
-def test_organize_tab_widgets_exist(app: MainWindow):
-    """
-    测试: “自动整理”标签页中的所有控件是否都已创建。
-    """
-    assert app.similarity_threshold_spinbox is not None
-    assert app.cluster_button is not None
-    assert app.rename_results_table_widget is not None
+    tab = app.analysis_cluster_tab
+    assert tab.dir_tree is not None
+    assert tab.refresh_tree_button is not None
+    assert tab.k_spinbox is not None
+    assert tab.similarity_threshold_spinbox is not None
+    assert tab.run_clustering_button is not None
+    assert tab.find_similar_button is not None
+    assert tab.results_table is not None
 
 def test_keyword_search_tab_widgets_exist(app: MainWindow):
     """
-    测试: “关键词搜索”标签页中的所有控件是否都已创建。
+    测试 (v2.0): “关键词搜索”标签页中的控件是否都已创建。
     """
-    assert app.keyword_input is not None
-    assert app.filename_search_button is not None
-    assert app.content_search_button is not None
-    assert app.keyword_search_results_widget is not None
+    tab = app.keyword_search_tab
+    assert tab.keyword_input is not None
+    assert tab.filename_search_button is not None
+    assert tab.content_search_button is not None
+    assert tab.results_list is not None
+    assert tab.export_button is not None
 
 def test_status_bar_widgets_exist(app: MainWindow):
     """
-    测试: 底部状态栏的控件是否都已创建。
+    测试 (v2.0): 底部状态栏的控件是否都已创建。
     """
     assert app.progress_bar is not None
     assert app.cancel_button is not None

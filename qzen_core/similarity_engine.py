@@ -8,7 +8,7 @@
 
 import logging
 import pickle
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
 import jieba  # 引入 jieba 分词库
 import numpy as np
@@ -31,6 +31,8 @@ class SimilarityEngine:
         feature_matrix (csr_matrix | None): 由 `vectorize_documents` 方法生成的
                                           文档-词项稀疏矩阵。在向量化之前为 None。
         stopwords (set[str]): 从外部文件和用户配置中加载的、统一的停用词集合。
+        doc_map (List[Dict[str, Any]]): 一个包含文档 ID 和路径的映射列表，
+                                       其顺序与特征矩阵的行一一对应。
     """
 
     def __init__(self, max_features: int = 5000, stopwords_path: str = "stopwords.txt", custom_stopwords: List[str] = None):
@@ -56,6 +58,7 @@ class SimilarityEngine:
             token_pattern=None
         )
         self.feature_matrix: csr_matrix | None = None
+        self.doc_map: List[Dict[str, Any]] = []
 
     def update_stopwords(self, custom_stopwords: List[str] = None) -> None:
         """

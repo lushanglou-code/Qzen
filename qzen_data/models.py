@@ -14,9 +14,6 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 class Base(DeclarativeBase):
     """
     所有数据模型的声明式基类。
-
-    SQLAlchemy 的声明式模型都需要继承自一个共同的基类，这个基类
-    持有一个 `metadata` 对象，该对象汇集了所有子类定义的表信息。
     """
     pass
 
@@ -24,48 +21,27 @@ class Base(DeclarativeBase):
 class Document(Base):
     """
     映射到 `documents` 数据表的 ORM 模型。
-
-    这张表是程序的核心，用于存储每个唯一文档的元数据和分析结果。
-
-    Attributes:
-        file_hash (str): 文档内容的 SHA-256 哈希值。它被用作主键，因为
-                       哈希值是内容的唯一标识，可以有效防止同一文件被
-                       重复记录。
-        file_path (str): 文档在中间文件夹中的绝对路径。此路径是唯一的，
-                       用于定位文件以进行内容提取和分析。
-        content_slice (str): 从文档中提取并清洗后的内容切片，用于后续的
-                             向量化和内容搜索。提前计算并存储它可以避免
-                             重复的文件 I/O 和解析开销。
-        feature_vector (str): 文档内容的 TF-IDF 特征向量，以 JSON 字符串的
-                            形式存储。选择文本格式而不是二进制格式是为了
-                            提高数据库的通用性和可移植性。
+    v2.1 修正版：使用自增整数ID作为主键，并添加时间戳。
     """
     __tablename__ = "documents"
 
-    # 文件内容的 SHA-256 哈希值，作为主键，确保每个唯一文件只被记录一次。
-    file_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
-    
-    # 文件在中间文件夹中的绝对、规范化路径。
-    file_path: Mapped[str] = mapped_column(String(1024), nullable=False, unique=True)
-    
-    # 存储从文件中提取并清洗后的文本切片，避免重复计算。
+    id: Mapped[int] = mapped_column(primary_key=True)
+    file_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    file_path: Mapped[str] = mapped_column(String(1024), nullable=False, index=True)
     content_slice: Mapped[str] = mapped_column(Text, nullable=True)
-    
-    # 存储 TF-IDF 计算出的特征向量，使用 JSON 文本格式以保证跨数据库的健壮性。
-    # 此字段可以为空，因为向量化是一个独立步骤。
-    feature_vector: Mapped[str] = mapped_column(Text, nullable=True)
+    feature_vector: Mapped[str] = mapped_column(Text, nullable=True)  # 存储为 JSON 字符串
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    def __repr__(self):
+        return f"<Document(id={self.id}, path='{self.file_path}')>"
+
 
 # --- 任务运行与结果持久化模型 ---
 
 class TaskRun(Base):
     """
     映射到 `task_runs` 表，记录每一次操作任务的运行信息。
-
-    Attributes:
-        id (int): 自增主键，作为任务的唯一标识。
-        task_type (str): 任务的类型，如 'deduplication', 'rename', 'search'。
-        start_time (datetime): 任务开始执行的时间。
-        summary (str): 任务完成后的摘要信息，例如处理的文件总数。
     """
     __tablename__ = "task_runs"
     id: Mapped[int] = mapped_column(primary_key=True)

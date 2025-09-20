@@ -1,10 +1,10 @@
 .. _modules:
 
 ##################
-代码模块文档
+代码模块文档 (v2.0)
 ##################
 
-本部分由 Sphinx 自动生成，详细记录了 Qzen 项目中每个 Python 模块的 API 和功能。
+本部分由 Sphinx 自动生成，详细记录了 Qzen v2.0 项目中每个 Python 模块的 API 和功能。
 
 表现层 (qzen_ui)
 ================================
@@ -15,6 +15,10 @@
    qzen_ui.main_window
    qzen_ui.config_dialog
    qzen_ui.worker
+   qzen_ui.tabs.setup_tab
+   qzen_ui.tabs.processing_tab
+   qzen_ui.tabs.analysis_cluster_tab
+   qzen_ui.tabs.keyword_search_tab
 
 业务逻辑层 (qzen_core)
 ====================================
@@ -22,9 +26,10 @@
    :caption: 业务逻辑层 (Core)
    :toctree: generated
 
-   qzen_core.orchestrator
-   qzen_core.similarity_engine
+   qzen_core.ingestion_service
    qzen_core.cluster_engine
+   qzen_core.analysis_service
+   qzen_core.similarity_engine
 
 数据访问层 (qzen_data)
 ======================================

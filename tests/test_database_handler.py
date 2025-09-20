@@ -10,8 +10,10 @@ import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+from sqlalchemy import inspect
+
 from qzen_data.database_handler import DatabaseHandler
-from qzen_data.models import Document
+from qzen_data.models import Document, Base
 
 
 class TestDatabaseHandler(unittest.TestCase):
@@ -23,6 +25,27 @@ class TestDatabaseHandler(unittest.TestCase):
         self.db_handler = DatabaseHandler(db_url="sqlite:///:memory:")
         # 在内存数据库中创建表
         self.db_handler.recreate_tables()
+
+    def test_recreate_tables_creates_all_tables(self):
+        """测试 recreate_tables 是否成功创建了所有定义的表。"""
+        # recreate_tables() 已经在 setUp() 中被调用
+
+        # 1. 获取所有期望存在的表的名称
+        # 从 Base.metadata 中获取所有通过 ORM 定义的表
+        expected_table_names = set(Base.metadata.tables.keys())
+        self.assertTrue(len(expected_table_names) > 0, "元数据中没有定义任何表，检查模型定义。")
+
+        # 2. 连接到数据库并使用 inspector 检查实际存在的表
+        # 注意：在单元测试中为了验证内部状态而访问“私有”方法是可以接受的
+        engine = self.db_handler._get_engine()
+        inspector = inspect(engine)
+        actual_table_names = set(inspector.get_table_names())
+
+        # 3. 验证实际创建的表与期望的表完全一致
+        self.assertSetEqual(actual_table_names, expected_table_names,
+                            f"数据库中创建的表与模型定义不完全匹配。\n"
+                            f"缺失的表: {expected_table_names - actual_table_names}\n"
+                            f"多余的表: {actual_table_names - expected_table_names}")
 
     def test_document_operations(self):
         """测试针对 Document 模型的增、查、改操作。"""
