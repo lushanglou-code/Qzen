@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-数据库操作模块 (v3.3 - 优化批量插入)。
+数据库操作模块 (v3.3.2 - 驱动兼容性修正)。
 
-此版本根据 mcp.json 中更新后的 DB_WRITE_CONSTRAINT 技术规定进行重构。
-测试证明，批量插入 (INSERT) 是安全的，因此相关方法已切换到高效的
-`add_all` 模式。批量更新 (UPDATE) 操作则维持逐一提交的保守策略，
-以规避已知的 sqlalchemy-dm 驱动 Bug。
+此版本根据 mcp.json 中更新后的 DB_WRITE_CONSTRAINT 技术规定进行重构，
+并解决了 `datetime.utcnow` 的 DeprecationWarning，同时切换到字符串时间戳
+以规避数据库驱动的 Bug。
 """
 
-import datetime
+from datetime import datetime, timezone
 from contextlib import contextmanager
 import logging
 import os
@@ -190,7 +189,10 @@ class DatabaseHandler:
         """
         创建一个新的任务运行记录。
         """
-        new_task = TaskRun(task_type=task_type, start_time=datetime.datetime.utcnow())
+        # v3.3.2 修正: 显式地创建一个 ISO 格式的字符串时间戳，以匹配模型。
+        # 注意：TaskRun 模型的 `start_time` 字段现在是 String 类型，其 default 参数
+        # 在这里不会被触发，因为我们是手动提供 start_time 的值。
+        new_task = TaskRun(task_type=task_type, start_time=datetime.now(timezone.utc).isoformat())
         with self.get_session() as session:
             session.add(new_task)
             session.commit()

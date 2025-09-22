@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-数据库模型定义模块。
+数据库模型定义模块 (v3.3.2 - 驱动兼容性修正)。
 
-使用 SQLAlchemy 的声明式系统 (Declarative System) 来定义与数据库表
-映射的 Python 类。每个类代表一个数据表，类的属性则映射到表的列。
+此版本将所有时间戳列的类型从 DateTime 更改为 String，并使用 ISO 8601
+格式的字符串 (`isoformat()`) 来存储时间。这旨在完全绕过 `sqlalchemy-dm`
+驱动中有缺陷的日期时间处理逻辑，从根本上解决 `DatabaseError`。
 """
 
-import datetime
-from sqlalchemy import String, Text, ForeignKey, DateTime
+from datetime import datetime, timezone
+from sqlalchemy import String, Text, ForeignKey
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -21,7 +22,6 @@ class Base(DeclarativeBase):
 class Document(Base):
     """
     映射到 `documents` 数据表的 ORM 模型。
-    v2.1 修正版：使用自增整数ID作为主键，并添加时间戳。
     """
     __tablename__ = "documents"
 
@@ -30,8 +30,9 @@ class Document(Base):
     file_path: Mapped[str] = mapped_column(String(1024), nullable=False, index=True)
     content_slice: Mapped[str] = mapped_column(Text, nullable=True)
     feature_vector: Mapped[str] = mapped_column(Text, nullable=True)  # 存储为 JSON 字符串
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
-    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    # v3.3.2 修正: 使用 String 类型存储 ISO 格式的时间戳字符串
+    created_at: Mapped[str] = mapped_column(String, default=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: Mapped[str] = mapped_column(String, default=lambda: datetime.now(timezone.utc).isoformat(), onupdate=lambda: datetime.now(timezone.utc).isoformat())
 
     def __repr__(self):
         return f"<Document(id={self.id}, path='{self.file_path}')>"
@@ -46,7 +47,8 @@ class TaskRun(Base):
     __tablename__ = "task_runs"
     id: Mapped[int] = mapped_column(primary_key=True)
     task_type: Mapped[str] = mapped_column(String(50), nullable=False)
-    start_time: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
+    # v3.3.2 修正: 使用 String 类型存储 ISO 格式的时间戳字符串
+    start_time: Mapped[str] = mapped_column(String, default=lambda: datetime.now(timezone.utc).isoformat())
     summary: Mapped[str] = mapped_column(Text, nullable=True)
 
 class DeduplicationResult(Base):

@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-数据库驱动行为的真实集成测试 (v3.3 修正版)。
+数据库驱动行为的真实集成测试 (v3.3.2 最终版)。
 
 此测试文件不使用任何模拟（Mock），它直接连接到真实的DM8数据库，
 旨在精确地、可重复地证明和验证 `sqlalchemy-dm` 驱动在不同写入
-场景下的行为，特别是与 SQLAlchemy 工作单元（Unit of Work）的交互。
-
-此版本修正了异常捕获逻辑，以匹配观察到的实际异常类型。
+场景下的行为，并验证我们针对其 Bug 的变通方案是有效的。
 """
 
 import pytest
@@ -46,22 +44,21 @@ def test_single_record_commit_succeeds(db_handler: DatabaseHandler):
     assert True
 
 
-def test_batch_update_with_single_commit_fails(db_handler: DatabaseHandler):
+def test_batch_update_with_string_timestamp_workaround_succeeds(db_handler: DatabaseHandler):
     """
-    验证缺陷：证明即使在 Python 层循环，但在循环外单次 commit，
-    依然会触发驱动的批量操作 Bug。
+    验证变通方案：证明在使用字符串时间戳的变通方案后，
+    批量更新 (Batch UPDATE) 现在可以成功执行，不再触发驱动 Bug。
     """
-    # 1. 先插入一条记录以便后续更新
+    # 1. 先插入两条记录以便后续更新
     with db_handler.get_session() as session:
-        doc1 = Document(file_hash="update_test_1", file_path="/path/update1.txt", content_slice="", feature_vector="")
-        doc2 = Document(file_hash="update_test_2", file_path="/path/update2.txt", content_slice="", feature_vector="")
+        doc1 = Document(file_hash="update_test_1", file_path="/path/update1.txt", content_slice="original_1")
+        doc2 = Document(file_hash="update_test_2", file_path="/path/update2.txt", content_slice="original_2")
         session.add_all([doc1, doc2])
         session.commit()
         doc1_id, doc2_id = doc1.id, doc2.id
 
     # 2. 获取这些记录，修改它们，然后尝试一次性提交更新
-    # v3.3 修正: 直接捕获实际抛出的 UnboundLocalError，而不是其包装器。
-    with pytest.raises(UnboundLocalError) as excinfo:
+    try:
         with db_handler.get_session() as session:
             retrieved_doc1 = session.get(Document, doc1_id)
             retrieved_doc2 = session.get(Document, doc2_id)
@@ -69,11 +66,16 @@ def test_batch_update_with_single_commit_fails(db_handler: DatabaseHandler):
             retrieved_doc2.content_slice = "updated_2"
             # 核心：在循环外提交，这将触发 SQLAlchemy 的工作单元进行批量 UPDATE
             session.commit()
-    
-    # 3. 断言我们捕获到了正确的、由驱动缺陷导致的错误
-    # v3.3 修正: 直接检查异常实例的字符串值。
-    assert "cannot access local variable 'str_result'" in str(excinfo.value)
-    logging.info(f"\nSUCCESS: Correctly captured the expected driver bug during batch UPDATE: {excinfo.value}")
+    except Exception as e:
+        pytest.fail(f"With the string-timestamp workaround, batch update failed unexpectedly: {e}")
+
+    # 3. 断言数据已被成功更新
+    with db_handler.get_session() as session:
+        final_doc1 = session.get(Document, doc1_id)
+        final_doc2 = session.get(Document, doc2_id)
+        assert final_doc1.content_slice == "updated_1"
+        assert final_doc2.content_slice == "updated_2"
+        logging.info("\nSUCCESS: Batch UPDATE with string-timestamp workaround completed successfully.")
 
 
 def test_commit_in_loop_succeeds(db_handler: DatabaseHandler):
