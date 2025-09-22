@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-数据库操作模块 (v3.3.2 - 驱动兼容性修正)。
+数据库操作模块 (v3.3.4 - 编码修正)。
 
 此版本根据 mcp.json 中更新后的 DB_WRITE_CONSTRAINT 技术规定进行重构，
 并解决了 `datetime.utcnow` 的 DeprecationWarning，同时切换到字符串时间戳
@@ -48,6 +48,10 @@ class DatabaseHandler:
             else:
                 engine_opts['poolclass'] = NullPool
                 connect_args['connection_timeout'] = 15
+                # v3.3.4 修正: 泛化达梦数据库的识别逻辑，确保编码设置生效
+                if self._db_url.startswith('dm'):
+                    connect_args['local_code'] = 1 # 1 = UTF-8
+                    logging.info("检测到达梦数据库，已强制设置连接编码为 UTF-8。")
 
             self._engine = create_engine(
                 self._db_url,

@@ -44,8 +44,10 @@ language = 'zh_CN'
 
 autosummary_generate = True #开启自动生成文件功能
 
-# 如果生成的 .rst 文件已存在，不要覆盖它。设为 False 可以在每次构建时重新生成。
-autosummary_generate_overwrite = False
+# v3.3.3 修正: 必须将此项设为 True，以确保每次构建时都重新生成存根文件，
+# 从而避免因代码中的 docstring 更新而导致与旧存根文件内容冲突，
+# 这是解决“duplicate object description”警告的核心。
+autosummary_generate_overwrite = True
 
 # Napoleon 插件设置，确保 Google 风格的 docstrings 被正确解析
 napoleon_google_docstring = True

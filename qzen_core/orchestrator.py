@@ -10,6 +10,8 @@ import logging
 import os
 import json
 import shutil
+import stat
+import errno
 from typing import Callable, List, Tuple, Set, Dict, Any
 
 import numpy as np
@@ -37,6 +39,20 @@ def _json_to_vector(json_str: str) -> csr_matrix:
     data = json.loads(json_str)
     return csr_matrix((data['data'], data['indices'], data['indptr']), shape=data['shape'])
 
+def handle_remove_readonly(func, path, exc_info):
+    """
+    shutil.rmtree 的错误处理程序，用于处理只读文件导致的权限错误。
+    """
+    # exc_info 包含 (type, value, traceback)
+    excvalue = exc_info[1]
+    if func in (os.rmdir, os.remove, os.unlink) and excvalue.errno == errno.EACCES:
+        # 更改文件权限为可写
+        os.chmod(path, stat.S_IWRITE)
+        # 重试操作
+        func(path)
+    else:
+        # 对于其他错误，重新引发异常
+        raise
 
 class Orchestrator:
     """
@@ -70,8 +86,8 @@ class Orchestrator:
         self.db_handler.recreate_tables()
         if os.path.exists(intermediate_path):
             try:
-                shutil.rmtree(intermediate_path)
-            except OSError as e:
+                shutil.rmtree(intermediate_path, onerror=handle_remove_readonly)
+            except Exception as e:
                 logging.error(f"无法删除中间文件夹: {e}")
                 raise
         os.makedirs(intermediate_path, exist_ok=True)
