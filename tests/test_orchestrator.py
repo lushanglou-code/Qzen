@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-单元测试模块：测试业务流程协调器 Orchestrator。
+单元测试模块：测试业务流程协调器 Orchestrator (v3.2 修正版)。
+
+此版本更新了对 prime_similarity_engine 的测试，以匹配 v3.2 中
+Orchestrator 和 SimilarityEngine 之间的新交互模式。
 """
 
 import os
@@ -128,29 +131,47 @@ class TestOrchestrator(unittest.TestCase):
         self.assertIn("无需操作", result_summary)
 
     def test_prime_similarity_engine_happy_path(self):
+        # v3.2 修正: 模拟 Document 对象时添加 id
         vec1, vec2 = csr_matrix(np.array([[1, 0, 1]])), csr_matrix(np.array([[0, 1, 1]]))
-        doc1, doc2, doc3 = Document(file_path="/path/doc1.txt", feature_vector=_vector_to_json(vec1)), Document(file_path="/path/doc2.txt", feature_vector=_vector_to_json(vec2)), Document(file_path="/path/doc3.txt", feature_vector=None)
+        doc1 = Document(id=1, file_path="/path/doc1.txt", feature_vector=_vector_to_json(vec1))
+        doc2 = Document(id=2, file_path="/path/doc2.txt", feature_vector=_vector_to_json(vec2))
+        doc3 = Document(id=3, file_path="/path/doc3.txt", feature_vector=None)
         self.mock_db_handler.get_all_documents.return_value = [doc1, doc2, doc3]
+        
         self.orchestrator.prime_similarity_engine()
+        
         self.mock_db_handler.get_all_documents.assert_called_once()
+        
+        # v3.2 修正: 不再检查 Orchestrator 的私有属性，而是检查其对 SimilarityEngine 的公共属性的设置
         expected_matrix = vstack([vec1, vec2])
+        expected_doc_map = [
+            {'id': 1, 'file_path': '/path/doc1.txt'},
+            {'id': 2, 'file_path': '/path/doc2.txt'}
+        ]
+        
         self.assertTrue(np.array_equal(self.orchestrator.similarity_engine.feature_matrix.toarray(), expected_matrix.toarray()))
-        self.assertEqual(self.orchestrator._doc_path_map, ["/path/doc1.txt", "/path/doc2.txt"])
+        self.assertEqual(self.orchestrator.similarity_engine.doc_map, expected_doc_map)
         self.assertTrue(self.orchestrator._is_engine_primed)
 
     def test_prime_similarity_engine_no_vectors(self):
         self.mock_db_handler.get_all_documents.return_value = [Document(file_path="/path/doc1.txt", feature_vector=None)]
+        
         self.orchestrator.prime_similarity_engine()
+        
+        # v3.2 修正: 检查 SimilarityEngine 的公共属性
         self.assertIsNone(self.orchestrator.similarity_engine.feature_matrix)
-        self.assertEqual(self.orchestrator._doc_path_map, [])
+        self.assertEqual(self.orchestrator.similarity_engine.doc_map, [])
         self.assertTrue(self.orchestrator._is_engine_primed)
 
     @patch('qzen_core.orchestrator.logging')
     def test_prime_similarity_engine_invalid_json(self, mock_logging):
         vec1 = csr_matrix(np.array([[1, 0, 1]]))
-        doc1, doc2 = Document(file_path="/path/doc1.txt", feature_vector=_vector_to_json(vec1)), Document(file_path="/path/doc2.txt", feature_vector="invalid-json")
+        doc1 = Document(file_path="/path/doc1.txt", feature_vector=_vector_to_json(vec1))
+        doc2 = Document(file_path="/path/doc2.txt", feature_vector="invalid-json")
         self.mock_db_handler.get_all_documents.return_value = [doc1, doc2]
+        
         self.orchestrator.prime_similarity_engine()
+        
         mock_logging.error.assert_called_once()
 
 if __name__ == '__main__':

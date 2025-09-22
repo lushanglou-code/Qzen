@@ -28,8 +28,8 @@
     "technical_mandates": [
       {
         "id": "DB_WRITE_CONSTRAINT",
-        "description": "Due to identified instability in the sqlalchemy-dm driver, all database write operations (INSERT, UPDATE) MUST be executed in a loop, one record at a time. Batch operations (e.g., `bulk_save_objects`, `add_all` on a list) are strictly forbidden to ensure stability.",
-        "reason": "The `sqlalchemy-dm` driver's `do_executemany` method has a bug that causes an `UnboundLocalError` when processing batch operations."
+        "description": "由于 `sqlalchemy-dm` 驱动中存在 Bug，所有数据库的 **更新（UPDATE）** 操作必须在循环中逐条执行并提交。批量 **插入（INSERT）** 操作（如 `session.add_all()`）经过验证是安全的，应该被用于提升大数据量插入的性能。批量更新（如 `session.commit()` 应用于多个 `merge` 或 `update` 对象）仍然被严格禁止。",
+        "reason": "The `sqlalchemy-dm` driver's `do_executemany` method has a bug that causes an `UnboundLocalError` when processing batch UPDATE operations, but not for batch INSERTs."
       }
     ]
   },

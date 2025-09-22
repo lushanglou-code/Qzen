@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-文件聚类引擎模块 (v3.0 - 增加空目录清理)。
+文件聚类引擎模块 (v3.0.1 - 修正空目录清理逻辑)。
 
-此版本通过在处理前校验数据，增加了对“脏数据”（如空的特征向量）的
-防御性，确保了聚类过程的健壮性。同时，在聚类完成后会自动清理空文件夹。
+此版本修复了 _remove_empty_subdirectories 方法中的一个 Bug，
+确保所有层级的空目录都能被正确地递归删除。
 """
 
 import logging
@@ -208,8 +208,11 @@ class ClusterEngine:
         logging.info(f"开始清理目录 '{path}' 下的空文件夹...")
         removed_count = 0
         # 从底向上遍历，这样可以先删除子目录再判断父目录是否为空
-        for dirpath, dirnames, filenames in os.walk(path, topdown=False):
-            if not dirnames and not filenames:
+        for dirpath, _, _ in os.walk(path, topdown=False):
+            # v3.0.1 修正: 不再依赖 os.walk 提供的 dirnames/filenames 列表，
+            # 因为它们是遍历开始前的快照。在每次循环中，我们必须用 os.listdir 
+            # 重新检查当前目录是否真的为空，以确保逻辑的正确性。
+            if not os.listdir(dirpath):
                 try:
                     os.rmdir(dirpath)
                     logging.info(f"  - 已删除空文件夹: {dirpath}")

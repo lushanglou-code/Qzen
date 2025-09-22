@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-数据库操作模块 (v3.2 - 新增按路径查询)。
+数据库操作模块 (v3.3 - 优化批量插入)。
 
-此版本根据 mcp.json 中的 DB_WRITE_CONSTRAINT 技术强制规定，
-将 session.commit() 移入循环内部，强制逐一提交，彻底禁用批量操作，
-以确保在不稳定的 sqlalchemy-dm 驱动下也能可靠运行。
+此版本根据 mcp.json 中更新后的 DB_WRITE_CONSTRAINT 技术规定进行重构。
+测试证明，批量插入 (INSERT) 是安全的，因此相关方法已切换到高效的
+`add_all` 模式。批量更新 (UPDATE) 操作则维持逐一提交的保守策略，
+以规避已知的 sqlalchemy-dm 驱动 Bug。
 """
 
 import datetime
@@ -166,17 +167,18 @@ class DatabaseHandler:
 
     def bulk_insert_documents(self, documents: List[Document]) -> None:
         """
-        v2.4 最终修正：逐一插入并立即提交，彻底禁用批量操作。
+        v3.3 优化: 使用 add_all 执行高效的批量插入。
         """
+        if not documents:
+            return
         with self.get_session() as session:
-            for doc in documents:
-                session.add(doc)
-                session.commit()
-            logging.info(f"成功逐一插入 {len(documents)} 条文档记录。")
+            session.add_all(documents)
+            session.commit()
+            logging.info(f"成功批量插入 {len(documents)} 条文档记录。")
 
     def bulk_update_documents(self, documents: List[Document]) -> None:
         """
-        v2.4 最终修正：逐一更新并立即提交，彻底禁用批量操作。
+        v2.4 最终修正：逐一更新并立即提交，以规避驱动 Bug。
         """
         with self.get_session() as session:
             for doc in documents:
@@ -206,27 +208,32 @@ class DatabaseHandler:
                 session.commit()
 
     def bulk_insert_deduplication_results(self, results: List[DeduplicationResult]) -> None:
-        """v2.4 最终修正：逐一插入并立即提交。"""
+        """v3.3 优化: 使用 add_all 执行高效的批量插入。"""
+        if not results:
+            return
         with self.get_session() as session:
-            for res in results:
-                session.add(res)
-                session.commit()
-            logging.info(f"成功逐一插入 {len(results)} 条去重结果。")
+            session.add_all(results)
+            session.commit()
+            logging.info(f"成功批量插入 {len(results)} 条去重结果。")
 
     def bulk_insert_rename_results(self, results: List[RenameResult]) -> None:
         """
-        v2.4 最终修正：逐一插入并立即提交。"""
+        v3.3 优化: 使用 add_all 执行高效的批量插入。
+        """
+        if not results:
+            return
         with self.get_session() as session:
-            for res in results:
-                session.add(res)
-                session.commit()
-            logging.info(f"成功逐一插入 {len(results)} 条重命名结果。")
+            session.add_all(results)
+            session.commit()
+            logging.info(f"成功批量插入 {len(results)} 条重命名结果。")
 
     def bulk_insert_search_results(self, results: List[SearchResult]) -> None:
         """
-        v2.4 最终修正：逐一插入并立即提交。"""
+        v3.3 优化: 使用 add_all 执行高效的批量插入。
+        """
+        if not results:
+            return
         with self.get_session() as session:
-            for res in results:
-                session.add(res)
-                session.commit()
-            logging.info(f"成功逐一插入 {len(results)} 条搜索结果。")
+            session.add_all(results)
+            session.commit()
+            logging.info(f"成功批量插入 {len(results)} 条搜索结果。")

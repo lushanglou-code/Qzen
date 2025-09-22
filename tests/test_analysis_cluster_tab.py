@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-测试单元：分析与聚类标签页 (v3.0 - 终极稳定版)。
+测试单元：分析与聚类标签页 (v3.2 修正版)。
 
 此测试验证 AnalysisClusterTab 的核心交互逻辑，确保在移除目录树后，
 通过文件夹选择对话框驱动的聚类流程能正确触发信号。
@@ -35,7 +35,8 @@ class TestAnalysisClusterTab(unittest.TestCase):
         test_k = 7
         test_threshold = 0.9
 
-        self.tab.set_target_dir(test_directory)
+        # v3.2 修正: 调用更新后的方法名
+        self.tab.set_cluster_target_dir(test_directory)
         self.tab.k_spinbox.setValue(test_k)
         self.tab.similarity_threshold_spinbox.setValue(test_threshold)
 
@@ -54,7 +55,8 @@ class TestAnalysisClusterTab(unittest.TestCase):
         测试边界条件：如果目标目录为空，则不应发射信号。
         """
         # 1. 确保目标目录为空
-        self.tab.set_target_dir("")
+        # v3.2 修正: 调用更新后的方法名
+        self.tab.set_cluster_target_dir("")
 
         # 2. 创建一个“间谍”函数
         spy_slot = Mock()
@@ -76,12 +78,13 @@ class TestAnalysisClusterTab(unittest.TestCase):
         mock_get_dir.return_value = test_path
 
         # 2. 模拟用户点击“选择文件夹”按钮
-        self.tab.select_target_dir_button.click()
+        # v3.2 修正: 调用更新后的按钮名
+        self.tab.select_cluster_target_dir_button.click()
 
         # 3. 断言：QLineEdit 中的文本已被更新为对话框返回的路径
-        self.assertEqual(self.tab.target_dir_line_edit.text(), test_path)
-        # 并且内部状态也已更新
-        self.assertEqual(self.tab.target_dir, test_path)
+        # v3.2 修正: 检查更新后的控件和属性名
+        self.assertEqual(self.tab.cluster_target_dir_line_edit.text(), test_path)
+        self.assertEqual(self.tab.cluster_target_dir, test_path)
 
 if __name__ == '__main__':
     unittest.main()
