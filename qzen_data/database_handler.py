@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-数据库操作模块 (v3.3.7 - 最终修复数据持久化逻辑)。
+数据库操作模块 (v3.4.1 - 优化批量插入的返回逻辑)。
 
-此版本最终修复了 `bulk_update_documents` 方法中的灾难性 Bug。
-之前版本的实现错误地只更新了 `file_path` 属性，而完全忽略了
-`feature_vector` 属性的更新，导致向量化结果无法被持久化，
-是引发所有下游聚类失败的根本原因。
+此版本在 v3.4.0 的基础上，修改了 `bulk_insert_documents` 方法，
+使其在完成插入后，返回一个包含所有被成功插入数据库的 `Document` 对象的列表。
 
-新的实现确保了在更新时，会同步传入对象的所有相关属性，从而保证
-无论是向量化还是聚类后的更新，都能被正确地、原子地提交到数据库。
-对于反复的、低级的、由我本人引入的错误，我深表歉意。
+这一修改至关重要，它使得业务逻辑层能够明确知道哪些文件是“新”的，
+从而可以对这些新文件执行后续操作，例如文件名冲突检查和重命名，
+为实现完整的去重策略铺平了道路。
 """
 
 from datetime import datetime, timezone
@@ -172,16 +170,44 @@ class DatabaseHandler:
         with self.get_session() as session:
             return session.query(Document).filter(Document.content_slice.like(f"%{keyword}%")).all()
 
-    def bulk_insert_documents(self, documents: List[Document]) -> None:
+    def bulk_insert_documents(self, documents: List[Document]) -> List[Document]:
         """
-        v3.3 优化: 使用 add_all 执行高效的批量插入。
+        v3.4.1 优化: 基于内容去重的高效批量插入，并返回新插入的记录。
+        在插入前检查文件哈希，避免 'IntegrityError'。
+
+        Returns:
+            List[Document]: 成功插入到数据库的新文档对象列表。
         """
         if not documents:
-            return
+            return []
+
+        # 1. 从待插入列表中提取所有哈希值
+        incoming_hashes = {doc.file_hash for doc in documents}
+
+        # 2. 查询数据库，找出这些哈希值中已经存在的
         with self.get_session() as session:
-            session.add_all(documents)
+            existing_hashes_query = session.query(Document.file_hash).filter(Document.file_hash.in_(incoming_hashes))
+            existing_hashes = {row[0] for row in existing_hashes_query}
+            logging.info(f"数据库查询完成，在 {len(incoming_hashes)} 个待插入项中发现 {len(existing_hashes)} 个已存在的哈希。")
+
+        # 3. 过滤掉已存在的文件，只准备插入新文件
+        documents_to_insert = [doc for doc in documents if doc.file_hash not in existing_hashes]
+        
+        num_duplicates = len(documents) - len(documents_to_insert)
+        if num_duplicates > 0:
+            logging.info(f"检测到 {num_duplicates} 个内容重复的文档，将跳过插入。")
+
+        # 4. 批量插入新文件
+        if not documents_to_insert:
+            logging.info("没有新的文档需要插入。")
+            return []
+            
+        with self.get_session() as session:
+            session.add_all(documents_to_insert)
             session.commit()
-            logging.info(f"成功批量插入 {len(documents)} 条文档记录。")
+            logging.info(f"成功批量插入 {len(documents_to_insert)} 条新文档记录。")
+        
+        return documents_to_insert
 
     def bulk_update_documents(self, documents: List[Document]) -> None:
         """
@@ -256,8 +282,7 @@ class DatabaseHandler:
 
     def bulk_insert_search_results(self, results: List[SearchResult]) -> None:
         """
-        v3.3 优化: 使用 add_all 执行高效的批量插入。
-        """
+        v3.3 优化: 使用 add_all 执行高效的批量插入。"""
         if not results:
             return
         with self.get_session() as session:

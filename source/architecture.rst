@@ -1,7 +1,7 @@
 .. _architecture:
 
 ##########################
-系统架构设计 (v3.3)
+系统架构设计 (v3.4)
 ##########################
 
 本文档详细描述了 Qzen 项目的技术选型、系统架构和关键设计决策。
@@ -110,6 +110,10 @@
 
 7.  **聚类后自动清理空文件夹**: 为了提升用户体验，在每一轮聚类操作成功执行后，程序会自动从底向上扫描目标文件夹，并删除所有在本次操作中产生的空子文件夹，以保持目录结构的整洁。
 
+8.  **数据摄取阶段的去重与重命名策略**: 为了确保数据库的唯一性并满足文件管理需求，数据摄取（文件扫描）阶段必须执行以下两步去重策略：
+    *   **基于内容去重 (Content-based Deduplication)**: 在将文件元数据插入 `documents` 表之前，必须先计算文件的哈希值 (`file_hash`)。通过查询数据库，检查该 `file_hash` 是否已存在。如果存在，则跳过该文件，不进行任何插入操作。这可以防止因内容相同的文件（即使文件名不同）导致 `IntegrityError`，并保证了每个独立内容只在数据库中存储一次。
+    *   **基于文件名冲突重命名 (Rename on Filename Conflict)**: 在文件被成功添加到数据库之后（即，其内容是唯一的），需要检查其文件名是否与目标目录中已有的文件冲突。如果一个文件内容不同，但文件名与另一个已处理的文件相同，则必须对其进行重命名（例如，在文件名后附加一个递增的数字或唯一标识符），以避免在最终的文件操作中发生覆盖或混淆。
+
 附录：DM8 数据库交互最佳实践
 ======================================
 
@@ -132,14 +136,26 @@
 基于以上发现，我们制定了以下强制性规则：
 
 **推荐 (批量插入)**
-   对于大批量的数据 **插入**，必须使用 ``session.add_all(objects)`` 配合循环或 ``with`` 块之外的 **单次** ``session.commit()`` 来完成，以获得最佳性能。
+   对于大批量的数据 **插入**，必须使用 ``session.add_all(objects)`` 配合单次 ``session.commit()`` 来完成，以获得最佳性能。**在构建待插入的对象列表之前，必须先查询数据库，过滤掉那些 `file_hash` 已经存在于 `documents` 表中的文件。** 这样可以从源头上避免 `IntegrityError`。
 
    .. code-block:: python
 
       # 正确的批量插入模式
+      # 1. 获取所有已存在的哈希值
       with db_handler.get_session() as session:
-          session.add_all(list_of_new_documents)
-          session.commit() # 在所有对象添加后，单次提交
+          existing_hashes = {row[0] for row in session.query(Document.file_hash).all()}
+
+      # 2. 过滤掉已存在的文件，只准备插入新文件
+      new_documents_to_insert = []
+      for doc_data in all_scanned_files:
+          if doc_data['file_hash'] not in existing_hashes:
+              new_documents_to_insert.append(Document(**doc_data))
+
+      # 3. 批量插入新文件
+      if new_documents_to_insert:
+          with db_handler.get_session() as session:
+              session.add_all(new_documents_to_insert)
+              session.commit() # 在所有对象添加后，单次提交
 
 **禁止 (批量更新)**
    对于 **更新** 已有数据的操作，必须严格遵守“逐条处理”的模式，即在循环中对每个对象单独执行 ``session.merge(obj)`` （或修改属性）和 ``session.commit()``，以规避驱动 Bug。
