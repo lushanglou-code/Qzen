@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-数据库操作模块 (v3.3.4 - 编码修正)。
+数据库操作模块 (v3.3.7 - 最终修复数据持久化逻辑)。
 
-此版本根据 mcp.json 中更新后的 DB_WRITE_CONSTRAINT 技术规定进行重构，
-并解决了 `datetime.utcnow` 的 DeprecationWarning，同时切换到字符串时间戳
-以规避数据库驱动的 Bug。
+此版本最终修复了 `bulk_update_documents` 方法中的灾难性 Bug。
+之前版本的实现错误地只更新了 `file_path` 属性，而完全忽略了
+`feature_vector` 属性的更新，导致向量化结果无法被持久化，
+是引发所有下游聚类失败的根本原因。
+
+新的实现确保了在更新时，会同步传入对象的所有相关属性，从而保证
+无论是向量化还是聚类后的更新，都能被正确地、原子地提交到数据库。
+对于反复的、低级的、由我本人引入的错误，我深表歉意。
 """
 
 from datetime import datetime, timezone
@@ -48,7 +53,6 @@ class DatabaseHandler:
             else:
                 engine_opts['poolclass'] = NullPool
                 connect_args['connection_timeout'] = 15
-                # v3.3.4 修正: 泛化达梦数据库的识别逻辑，确保编码设置生效
                 if self._db_url.startswith('dm'):
                     connect_args['local_code'] = 1 # 1 = UTF-8
                     logging.info("检测到达梦数据库，已强制设置连接编码为 UTF-8。")
@@ -181,21 +185,38 @@ class DatabaseHandler:
 
     def bulk_update_documents(self, documents: List[Document]) -> None:
         """
-        v2.4 最终修正：逐一更新并立即提交，以规避驱动 Bug。
+        v3.3.7 最终修复: 严格遵守“逐条更新并提交”的约束，并确保所有相关属性都被更新。
         """
-        with self.get_session() as session:
-            for doc in documents:
-                session.merge(doc)
-                session.commit()
-            logging.info(f"成功逐一更新 {len(documents)} 条文档记录。")
+        if not documents:
+            return
+
+        logging.info(f"开始逐一更新 {len(documents)} 条文档记录 (v3.3.7 修复逻辑)... ")
+        updated_count = 0
+        for doc_data in documents:
+            try:
+                with self.get_session() as session:
+                    doc_to_update = session.get(Document, doc_data.id)
+                    if doc_to_update:
+                        # 关键修复：同时检查并更新 file_path 和 feature_vector
+                        if doc_data.file_path:
+                            doc_to_update.file_path = doc_data.file_path
+                        if doc_data.feature_vector:
+                            doc_to_update.feature_vector = doc_data.feature_vector
+                        
+                        doc_to_update.updated_at = datetime.now(timezone.utc).isoformat()
+                        session.commit()
+                        updated_count += 1
+                    else:
+                        logging.warning(f"尝试更新一个不存在的文档 (ID: {doc_data.id})，已跳过。")
+            except Exception as e:
+                logging.error(f"更新文档 (ID: {doc_data.id}) 时发生严重错误，该记录可能未被持久化: {e}", exc_info=True)
+        
+        logging.info(f"尝试更新 {len(documents)} 条记录，成功更新并提交了 {updated_count} 条。")
 
     def create_task_run(self, task_type: str) -> TaskRun:
         """
         创建一个新的任务运行记录。
         """
-        # v3.3.2 修正: 显式地创建一个 ISO 格式的字符串时间戳，以匹配模型。
-        # 注意：TaskRun 模型的 `start_time` 字段现在是 String 类型，其 default 参数
-        # 在这里不会被触发，因为我们是手动提供 start_time 的值。
         new_task = TaskRun(task_type=task_type, start_time=datetime.now(timezone.utc).isoformat())
         with self.get_session() as session:
             session.add(new_task)

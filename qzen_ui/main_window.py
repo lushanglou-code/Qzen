@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Qzen 主窗口模块 (v3.2 - 功能完善版)。
+Qzen 主窗口模块 (v4.0.0 - 架构重构)。
 
-此版本实现了完整的“相似文件分析”功能，包括文件选择、
-带复选框的结果展示和选择性导出。
+此版本与所有 v4.0.0 的子模块（引擎、协调器、UI标签页）保持同步，
+完成了聚类功能解耦的最终实现。旧的、捆绑式的聚类调用逻辑被彻底
+替换为两个独立的、由新UI触发的原子化操作：K-Means聚类和相似度分组。
 """
 
 from __future__ import annotations # PEP 563: Solves circular import issues with type hints.
@@ -19,11 +20,11 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QAction, QCloseEvent
 from PyQt6.QtCore import pyqtSignal
 
-# --- v3.2 架构引入 ---
+# --- v4.0.0 架构引入 ---
 from qzen_core.orchestrator import Orchestrator
 from qzen_core.analysis_service import AnalysisService
 
-# --- v3.2 UI模块导入 ---
+# --- v4.0.0 UI模块导入 ---
 from qzen_ui.tabs.setup_tab import SetupTab
 from qzen_ui.tabs.processing_tab import ProcessingTab
 from qzen_ui.tabs.analysis_cluster_tab import AnalysisClusterTab
@@ -51,7 +52,7 @@ class MainWindow(QMainWindow):
         self.analysis_service: AnalysisService | None = None
         self.worker: Worker | None = None
 
-        self.setWindowTitle("Qzen (千针) v3.2 - 智能文档组织引擎")
+        self.setWindowTitle("Qzen (千针) v4.0 - 智能文档组织引擎")
         self.setGeometry(100, 100, 1200, 800)
 
         self._create_menus()
@@ -109,8 +110,9 @@ class MainWindow(QMainWindow):
         self.setup_tab.save_stopwords_clicked.connect(self._save_app_config)
         self.processing_tab.start_ingestion_clicked.connect(self.start_ingestion)
         
-        # 分析与聚类标签页信号
-        self.analysis_cluster_tab.run_clustering_clicked.connect(self.start_clustering)
+        # --- v4.0.0 架构重构: 聚类信号连接更新 ---
+        self.analysis_cluster_tab.run_kmeans_clicked.connect(self.start_kmeans_clustering)
+        self.analysis_cluster_tab.run_similarity_clicked.connect(self.start_similarity_clustering)
         self.analysis_cluster_tab.select_source_file_clicked.connect(self._select_source_file)
         self.analysis_cluster_tab.find_similar_clicked.connect(self.find_similar_files)
         self.analysis_cluster_tab.export_similar_clicked.connect(self.export_similar_files)
@@ -139,7 +141,7 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def show_about_dialog(self):
-        QMessageBox.about(self, "关于 Qzen (千针)", "<p><b>Qzen (千针) v3.2</b></p><p>智能文档组织引擎。</p>")
+        QMessageBox.about(self, "关于 Qzen (千针)", "<p><b>Qzen (千针) v4.0</b></p><p>智能文档组织引擎。</p>")
 
     def _update_tab_states(self):
         is_db_configured = self.orchestrator is not None
@@ -150,7 +152,9 @@ class MainWindow(QMainWindow):
     def _select_directory(self, tab: QWidget, line_edit_name: str, caption: str):
         directory = QFileDialog.getExistingDirectory(self, caption)
         if directory:
-            tab.set_path_text(line_edit_name, directory)
+            # v4.0.0 修正: 确保聚类目标文件夹选择器也能正确更新
+            if hasattr(tab, 'set_path_text'):
+                tab.set_path_text(line_edit_name, directory)
             if line_edit_name == "intermediate_dir_input":
                 self.analysis_cluster_tab.set_cluster_target_dir(directory)
 
@@ -169,7 +173,7 @@ class MainWindow(QMainWindow):
                 db_handler=self.db_handler,
                 max_features=config.get("max_features", 5000),
                 slice_size_kb=config.get("slice_size_kb", 1024),
-                custom_stopwords=config['custom_stopwords'].splitlines()
+                custom_stopwords=config.get('custom_stopwords', '').splitlines()
             )
             self.analysis_service = AnalysisService(self.db_handler, self.orchestrator)
 
@@ -212,15 +216,21 @@ class MainWindow(QMainWindow):
         self.processing_tab.append_result(summary)
         self.on_task_finished("数据摄取流程成功完成！")
 
-    # --- 阶段三：聚类 ---
-    def start_clustering(self, target_dir: str, k: int, threshold: float):
+    # --- 阶段三：聚类 (v4.0.0 架构重构) ---
+    def start_kmeans_clustering(self, target_dir: str, k: int):
         if not self.orchestrator: return
-        reply = QMessageBox.question(self, "确认聚类", f"确定要对文件夹 '{os.path.basename(target_dir)}' 执行聚类吗？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        reply = QMessageBox.question(self, "确认 K-Means 聚类", f"确定要对文件夹 '{os.path.basename(target_dir)}' 及其所有子文件夹执行 K-Means 聚类 (K={k}) 吗？\n此操作将重塑该文件夹的内部结构。", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.No: return
-        self._start_task(self.orchestrator.run_iterative_clustering, self.on_clustering_finished, target_dir=target_dir, k=k, similarity_threshold=threshold)
+        self._start_task(self.orchestrator.run_kmeans_clustering, self.on_clustering_finished, target_dir=target_dir, k=k)
+
+    def start_similarity_clustering(self, target_dir: str, threshold: float):
+        if not self.orchestrator: return
+        reply = QMessageBox.question(self, "确认相似度分组", f"确定要对文件夹 '{os.path.basename(target_dir)}' 及其所有子文件夹执行相似度分组 (阈值={threshold}) 吗？\n此操作将重塑该文件夹的内部结构。", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.No: return
+        self._start_task(self.orchestrator.run_similarity_clustering, self.on_clustering_finished, target_dir=target_dir, threshold=threshold)
 
     def on_clustering_finished(self, summary: str):
-        final_message = f"本轮聚类已成功完成！\n{summary}\n\n您现在可以打开文件浏览器查看整理好的文件夹。"
+        final_message = f"本轮聚类操作已成功完成！\n{summary}\n\n您现在可以打开文件浏览器查看整理好的文件夹。"
         self.on_task_finished(final_message)
 
     # --- 阶段四：关键词搜索 ---
@@ -342,4 +352,4 @@ class MainWindow(QMainWindow):
     def update_progress(self, current_value: int, max_value: int, status_text: str):
         self.progress_bar.setMaximum(max_value)
         self.progress_bar.setValue(current_value)
-        self.setWindowTitle(f"Qzen (千针) v3.2 - {status_text}")
+        self.setWindowTitle(f"Qzen (千针) v4.0 - {status_text}")

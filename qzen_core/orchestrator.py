@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-业务流程协调器模块 (v3.2)。
+业务流程协调器模块 (v4.0.1 - 路径规范化修复)。
 
-定义了 Orchestrator 类，作为业务逻辑层的“总指挥”，负责协调
-数据访问层和各个业务引擎，以完成一个完整的用户请求流程。
+此版本修复了从 UI 接收到的路径格式不一致的问题。
+之前，UI 传递的路径可能使用正斜杠 (e.g., 'E:/folder')，而数据库中存储的是
+原生反斜杠路径 (e.g., 'E:\\folder')。这会导致在上游的预热和查询步骤中
+因路径不匹配而失败。
+
+本次修复在所有接收目录路径的业务逻辑入口（如 `run_kmeans_clustering`）
+处，立即使用 `os.path.normpath()` 将路径转换为当前操作系统的原生格式，
+确保了整个处理链条中路径格式的统一和正确性。
 """
 
 import logging
@@ -43,15 +49,11 @@ def handle_remove_readonly(func, path, exc_info):
     """
     shutil.rmtree 的错误处理程序，用于处理只读文件导致的权限错误。
     """
-    # exc_info 包含 (type, value, traceback)
     excvalue = exc_info[1]
     if func in (os.rmdir, os.remove, os.unlink) and excvalue.errno == errno.EACCES:
-        # 更改文件权限为可写
         os.chmod(path, stat.S_IWRITE)
-        # 重试操作
         func(path)
     else:
-        # 对于其他错误，重新引发异常
         raise
 
 class Orchestrator:
@@ -200,7 +202,6 @@ class Orchestrator:
     def find_top_n_similar_for_file(self, target_file_id: int, n: int, is_cancelled_callback: Callable[[], bool] = lambda: False) -> List[Dict[str, Any]]:
         """
         为指定文件 ID 查找最相似的 N 个其他文件。
-        v3.2 修正: 返回一个包含 id, path 和 score 的字典列表。
         """
         self.prime_similarity_engine(is_cancelled_callback=is_cancelled_callback)
         if is_cancelled_callback() or not self._is_engine_primed or self.similarity_engine.feature_matrix is None:
@@ -224,44 +225,59 @@ class Orchestrator:
             } for i, score in zip(indices, scores)
         ]
 
-    def run_iterative_clustering(self, target_dir: str, k: int, similarity_threshold: float,
-                                 progress_callback: Callable,
-                                 is_cancelled_callback: Callable[[], bool] = lambda: False) -> str:
+    def run_kmeans_clustering(self, target_dir: str, k: int, progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> str:
         """
-        在指定目录上执行一轮完整的“K-Means + 相似度”聚类。
+        在指定目录上执行 K-Means 聚类。
         """
-        logging.info(f"Orchestrator 收到对目录 '{target_dir}' 的聚类请求。")
+        native_target_dir = os.path.normpath(target_dir)
+        logging.info(f"Orchestrator 收到对目录 '{target_dir}' 的 K-Means 聚类请求 (K={k})。已规范化为: '{native_target_dir}'")
         
         self.prime_similarity_engine(is_cancelled_callback=is_cancelled_callback)
-        if is_cancelled_callback():
-            return "任务已取消"
-        
+        if is_cancelled_callback(): return "任务已取消"
         if self.similarity_engine.feature_matrix is None or self.similarity_engine.feature_matrix.shape[0] == 0:
-            return "没有可供聚类的文档。"
+            return "没有可供聚类的文档 (引擎预热失败，可能因上游向量化错误)。"
 
         try:
-            task_run = self.db_handler.create_task_run(task_type='iterative_clustering')
-            
-            self.cluster_engine.run_clustering(
-                target_dir=target_dir,
-                k=k,
-                similarity_threshold=similarity_threshold,
-                progress_callback=progress_callback,
-                is_cancelled_callback=is_cancelled_callback
-            )
-
+            task_run = self.db_handler.create_task_run(task_type='kmeans_clustering')
+            success = self.cluster_engine.run_kmeans_clustering(native_target_dir, k, progress_callback, is_cancelled_callback)
             if is_cancelled_callback():
-                summary = "聚类任务被用户取消。"
-                self.db_handler.update_task_summary(task_run.id, summary)
-                return summary
-
-            summary = f"对目录 '{os.path.basename(target_dir)}' 的迭代聚类已成功完成。"
+                summary = "K-Means 聚类任务被用户取消。"
+            elif success:
+                summary = f"对目录 '{os.path.basename(native_target_dir)}' 的 K-Means 聚类已成功完成。"
+            else:
+                summary = f"K-Means 聚类操作已跳过，详情请查看日志。"
             self.db_handler.update_task_summary(task_run.id, summary)
             return summary
-
         except Exception as e:
-            logging.error(f"在执行迭代聚类时发生意外错误: {e}", exc_info=True)
-            return f"聚类失败: {e}"
+            logging.error(f"在执行 K-Means 聚类时发生意外错误: {e}", exc_info=True)
+            return f"K-Means 聚类失败: {e}"
+
+    def run_similarity_clustering(self, target_dir: str, threshold: float, progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> str:
+        """
+        在指定目录上执行相似度分组。
+        """
+        native_target_dir = os.path.normpath(target_dir)
+        logging.info(f"Orchestrator 收到对目录 '{target_dir}' 的相似度分组请求 (阈值={threshold})。已规范化为: '{native_target_dir}'")
+
+        self.prime_similarity_engine(is_cancelled_callback=is_cancelled_callback)
+        if is_cancelled_callback(): return "任务已取消"
+        if self.similarity_engine.feature_matrix is None or self.similarity_engine.feature_matrix.shape[0] == 0:
+            return "没有可供聚类的文档 (引擎预热失败，可能因上游向量化错误)。"
+
+        try:
+            task_run = self.db_handler.create_task_run(task_type='similarity_clustering')
+            success = self.cluster_engine.run_similarity_clustering(native_target_dir, threshold, progress_callback, is_cancelled_callback)
+            if is_cancelled_callback():
+                summary = "相似度分组任务被用户取消。"
+            elif success:
+                summary = f"对目录 '{os.path.basename(native_target_dir)}' 的相似度分组已成功完成。"
+            else:
+                summary = f"相似度分组操作已跳过，详情请查看日志。"
+            self.db_handler.update_task_summary(task_run.id, summary)
+            return summary
+        except Exception as e:
+            logging.error(f"在执行相似度分组时发生意外错误: {e}", exc_info=True)
+            return f"相似度分组失败: {e}"
 
     def run_filename_search(self, keyword: str, intermediate_path: str, target_path: str, allowed_extensions: Set[str], progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> Tuple[str, List[SearchResult]]:
         """在中间文件夹中按文件名搜索，并将结果存入数据库。"""

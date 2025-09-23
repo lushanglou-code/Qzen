@@ -1,58 +1,67 @@
 # -*- coding: utf-8 -*-
 """
-日志系统配置模块。
+日志系统配置模块 (v1.2 - 最终修复版)。
 
-提供一个统一的函数 `setup_logging` 来配置应用程序全局的日志记录器。
-通过在程序启动时调用此单一函数，可以确保所有模块的日志行为一致。
+此版本彻底修复了因不当使用 `logging.basicConfig` 导致的日志系统静默失败问题。
+旧的实现会在 `main.py` 隐式创建默认 handler 后失效，导致文件 handler 从未被注册。
+
+新的实现遵循 `logging` 模块的最佳实践：
+1.  直接获取根记录器 (root logger)。
+2.  清空其上所有已存在的 handlers，确保配置的幂等性。
+3.  显式地创建、配置并添加 `StreamHandler` 和 `RotatingFileHandler`。
+
+这确保了无论在何处、何时调用，日志系统都能被正确、健壮地初始化，
+从而保证所有线程的日志都能被统一捕获到控制台和文件。
 """
 
 import logging
 import os
+import sys
 from logging.handlers import RotatingFileHandler
 
 
 def setup_logging() -> None:
     """
     配置全局的根日志记录器 (root logger)。
-
-    此函数执行以下操作：
-        1.  确保 `logs` 目录存在，用于存放日志文件。
-        2.  设置一个 `RotatingFileHandler`，它会自动管理日志文件的大小。
-            当日志文件达到1MB时，它会被重命名备份，并创建一个新的日志文件。
-            最多会保留5个备份文件。
-        3.  定义一个标准的日志格式，包含时间、记录器名称、日志级别和消息内容。
-        4.  使用 `logging.basicConfig` 来应用配置，将日志同时输出到
-            控制台 (StreamHandler) 和文件 (RotatingFileHandler)。
     """
     log_dir = "logs"
-    # 确保日志文件存放的目录存在
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
 
-    # 创建一个循环写入的日志文件处理器。
-    # 每个文件最大1MB，当超过大小时，会创建新的，最多保留5个旧的备份文件。
     log_file = os.path.join(log_dir, "qzen_app.log")
+    
+    # 定义统一的日志格式
+    log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(threadName)s - %(message)s')
+
+    # --- 创建并配置 Handlers ---
+    # 控制台 Handler
+    stream_handler = logging.StreamHandler(sys.stdout) # 明确指定输出到标准输出
+    stream_handler.setFormatter(log_format)
+
+    # 文件 Handler (循环写入)
     file_handler = RotatingFileHandler(
         log_file, 
-        maxBytes=1*1024*1024, # 1 MB
+        maxBytes=5*1024*1024, # 5 MB
         backupCount=5, 
         encoding='utf-8'
     )
-    
-    # 定义所有日志消息的格式。
-    # asctime: 日志记录时间
-    # name: 日志记录器的名称 (例如，'qzen_core.orchestrator')
-    # levelname: 日志级别 (例如，INFO, WARNING, ERROR)
-    # message: 实际的日志消息
-    log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(log_format)
 
-    # 使用 basicConfig 对根记录器进行一次性配置。
-    # 这会移除所有现有的处理器并添加这里指定的处理器。
-    logging.basicConfig(
-        level=logging.DEBUG,  # 设置根记录器处理的最低日志级别为 DEBUG
-        handlers=[
-            logging.StreamHandler(),  # 将日志输出到标准错误流（通常是控制台）
-            file_handler              # 将日志输出到文件
-        ]
-    )
+    # --- 配置根记录器 (Root Logger) ---
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO) # 设置全局最低日志级别
+
+    # 关键修复：清空所有现有的 handlers，确保从干净的状态开始配置
+    if root_logger.hasHandlers():
+        root_logger.handlers.clear()
+
+    # 为根记录器添加我们新创建的 handlers
+    root_logger.addHandler(stream_handler)
+    root_logger.addHandler(file_handler)
+
+    # --- 调整特定库的日志级别，保持输出整洁 ---
+    logging.getLogger("jieba").setLevel(logging.INFO)
+    logging.getLogger("PIL").setLevel(logging.INFO)
+    logging.getLogger("matplotlib").setLevel(logging.INFO)
+
+    logging.info("日志系统 (v1.2) 已成功配置，所有日志将同步输出到控制台和文件。")

@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-UI 模块：配置标签页 (v2.0)
+UI 模块：配置标签页 (v2.1 - 路径规范化修复)。
 
-定义了应用程序的第一个标签页，负责所有用户配置的 UI。
+此版本修复了在配置页面上显示和处理路径时，未使用平台原生路径分隔符的问题。
+现在，所有设置路径的方法 (`set_path_text`, `set_all_configs`) 都会使用
+`os.path.normpath()` 来确保显示的路径符合当前操作系统的标准 (e.g., 'E:\\folder')，
+从 UI 源头保证了路径格式的一致性。
 """
 
+import os
 from PyQt6.QtWidgets import (
     QWidget, QGridLayout, QLabel, QLineEdit, QPushButton, QSpinBox, 
     QPlainTextEdit, QHBoxLayout
@@ -127,14 +131,21 @@ class SetupTab(QWidget):
         }
 
     def set_all_configs(self, config: dict):
-        """根据提供的字典，设置此标签页上的所有配置项。"""
-        self.source_dir_input.setText(config.get("source_dir", ""))
-        self.intermediate_dir_input.setText(config.get("intermediate_dir", ""))
-        self.target_dir_input.setText(config.get("target_dir", ""))
+        """根据提供的字典，设置此标签页上的所有配置项，并确保路径为原生格式。"""
+        source_dir = config.get("source_dir", "")
+        self.source_dir_input.setText(os.path.normpath(source_dir) if source_dir else "")
+
+        intermediate_dir = config.get("intermediate_dir", "")
+        self.intermediate_dir_input.setText(os.path.normpath(intermediate_dir) if intermediate_dir else "")
+
+        target_dir = config.get("target_dir", "")
+        self.target_dir_input.setText(os.path.normpath(target_dir) if target_dir else "")
+
         self.max_features_spinbox.setValue(config.get("max_features", 5000))
         self.custom_stopwords_input.setPlainText(config.get("custom_stopwords", ""))
 
     def set_path_text(self, line_edit_name: str, path: str):
-        """设置指定输入框的文本。"""
+        """设置指定输入框的文本，并确保使用原生路径分隔符。"""
         if hasattr(self, line_edit_name):
-            getattr(self, line_edit_name).setText(path)
+            native_path = os.path.normpath(path) if path else ""
+            getattr(self, line_edit_name).setText(native_path)

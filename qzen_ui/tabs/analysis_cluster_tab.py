@@ -1,11 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-UI 模块：分析与聚类标签页 (v3.2 - 新增相似文件分析)。
+UI 模块：分析与聚类标签页 (v4.0.1 - 路径规范化修复)。
 
-此版本在保留了稳定的聚类功能的基础上，新增了“相似文件分析”
-功能区，允许用户选择一个文件，查找并导出其最相似的文件。
+此版本修复了 UI 层路径显示和处理不一致的问题。
+之前，从 QFileDialog 获取的路径（在 Windows 上可能使用'/'）被直接使用，
+导致向后端传递了非原生的路径格式。
+
+本次修复通过在接收路径的函数（`_on_select_cluster_target_dir` 和 `set_source_file`）
+中立即使用 `os.path.normpath()`，确保了 UI 显示和传递给后端的路径始终是
+当前操作系统的原生格式 (e.g., 'E:\\folder')，从根源上保证了路径的一致性。
 """
 
+import os
 from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel, QSpinBox, 
     QDoubleSpinBox, QLineEdit, QFileDialog, QGroupBox, QTableWidget, 
@@ -18,13 +24,12 @@ class AnalysisClusterTab(QWidget):
     """
     封装了“分析与聚类”标签页的所有 UI 控件和布局。
     """
-    # --- 聚类信号 ---
-    run_clustering_clicked = pyqtSignal(str, int, float)
+    run_kmeans_clicked = pyqtSignal(str, int)
+    run_similarity_clicked = pyqtSignal(str, float)
     
-    # --- v3.2 新增：相似文件分析信号 ---
     select_source_file_clicked = pyqtSignal()
-    find_similar_clicked = pyqtSignal(int, int) # source_file_id, top_n
-    export_similar_clicked = pyqtSignal(list, str) # doc_ids, source_file_path
+    find_similar_clicked = pyqtSignal(int, int)
+    export_similar_clicked = pyqtSignal(list, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -37,15 +42,13 @@ class AnalysisClusterTab(QWidget):
     def _init_ui(self):
         """创建并布局所有 UI 控件。"""
         main_layout = QVBoxLayout(self)
-
-        # --- v3.2 功能区划分 ---
-        main_layout.addWidget(self._create_clustering_group())
-        main_layout.addWidget(self._create_similarity_group())
+        main_layout.addWidget(self._create_atomic_clustering_group())
+        main_layout.addWidget(self._create_similarity_analysis_group())
         main_layout.addStretch()
 
-    def _create_clustering_group(self) -> QGroupBox:
-        """创建聚类功能区。"""
-        group_box = QGroupBox("多轮次聚类引擎")
+    def _create_atomic_clustering_group(self) -> QGroupBox:
+        """创建原子化聚类功能区。"""
+        group_box = QGroupBox("原子化聚类操作")
         layout = QVBoxLayout()
 
         target_dir_layout = QHBoxLayout()
@@ -57,29 +60,35 @@ class AnalysisClusterTab(QWidget):
         target_dir_layout.addWidget(self.cluster_target_dir_line_edit)
         target_dir_layout.addWidget(self.select_cluster_target_dir_button)
 
-        cluster_controls_layout = QHBoxLayout()
-        cluster_controls_layout.addWidget(QLabel("K-Means K值:"))
+        kmeans_layout = QHBoxLayout()
+        kmeans_layout.addWidget(QLabel("K-Means K值:"))
         self.k_spinbox = QSpinBox()
         self.k_spinbox.setRange(2, 100)
-        self.k_spinbox.setValue(5)
-        cluster_controls_layout.addWidget(self.k_spinbox)
-        cluster_controls_layout.addWidget(QLabel("相似度阈值:"))
+        self.k_spinbox.setValue(3)
+        kmeans_layout.addWidget(self.k_spinbox)
+        self.run_kmeans_button = QPushButton("执行 K-Means 聚类")
+        kmeans_layout.addWidget(self.run_kmeans_button)
+        kmeans_layout.addStretch()
+
+        similarity_layout = QHBoxLayout()
+        similarity_layout.addWidget(QLabel("相似度阈值:"))
         self.similarity_threshold_spinbox = QDoubleSpinBox()
         self.similarity_threshold_spinbox.setRange(0.1, 1.0)
         self.similarity_threshold_spinbox.setSingleStep(0.05)
         self.similarity_threshold_spinbox.setValue(0.85)
-        cluster_controls_layout.addWidget(self.similarity_threshold_spinbox)
-        self.run_clustering_button = QPushButton("对指定文件夹运行聚类")
-        cluster_controls_layout.addWidget(self.run_clustering_button)
-        cluster_controls_layout.addStretch()
+        similarity_layout.addWidget(self.similarity_threshold_spinbox)
+        self.run_similarity_button = QPushButton("执行相似度分组")
+        similarity_layout.addWidget(self.run_similarity_button)
+        similarity_layout.addStretch()
 
         layout.addLayout(target_dir_layout)
-        layout.addLayout(cluster_controls_layout)
+        layout.addLayout(kmeans_layout)
+        layout.addLayout(similarity_layout)
         group_box.setLayout(layout)
         return group_box
 
-    def _create_similarity_group(self) -> QGroupBox:
-        """v3.2 新增: 创建相似文件分析功能区。"""
+    def _create_similarity_analysis_group(self) -> QGroupBox:
+        """创建相似文件分析功能区。"""
         group_box = QGroupBox("相似文件分析")
         layout = QVBoxLayout()
 
@@ -127,7 +136,9 @@ class AnalysisClusterTab(QWidget):
     def _connect_signals(self):
         """连接内部 UI 事件到外部信号。"""
         self.select_cluster_target_dir_button.clicked.connect(self._on_select_cluster_target_dir)
-        self.run_clustering_button.clicked.connect(self._on_run_clustering)
+        self.run_kmeans_button.clicked.connect(self._on_run_kmeans)
+        self.run_similarity_button.clicked.connect(self._on_run_similarity)
+        
         self.select_source_file_button.clicked.connect(self.select_source_file_clicked.emit)
         self.find_similar_button.clicked.connect(self._on_find_similar)
         self.export_similar_button.clicked.connect(self._on_export_similar)
@@ -136,13 +147,19 @@ class AnalysisClusterTab(QWidget):
     def _on_select_cluster_target_dir(self):
         directory = QFileDialog.getExistingDirectory(self, "选择聚类目标文件夹")
         if directory:
-            self.set_cluster_target_dir(directory)
+            # 关键修复：立即将路径转换为原生格式
+            native_path = os.path.normpath(directory)
+            self.set_cluster_target_dir(native_path)
 
-    def _on_run_clustering(self):
+    def _on_run_kmeans(self):
         if self.cluster_target_dir:
             k = self.k_spinbox.value()
+            self.run_kmeans_clicked.emit(self.cluster_target_dir, k)
+
+    def _on_run_similarity(self):
+        if self.cluster_target_dir:
             threshold = self.similarity_threshold_spinbox.value()
-            self.run_clustering_clicked.emit(self.cluster_target_dir, k, threshold)
+            self.run_similarity_clicked.emit(self.cluster_target_dir, threshold)
 
     def _on_find_similar(self):
         if self.source_file_id != -1:
@@ -164,13 +181,17 @@ class AnalysisClusterTab(QWidget):
     # --- 公共接口 ---
 
     def set_cluster_target_dir(self, path: str):
-        self.cluster_target_dir = path
-        self.cluster_target_dir_line_edit.setText(path)
+        # 确保传入的任何路径都被规范化
+        native_path = os.path.normpath(path) if path else ""
+        self.cluster_target_dir = native_path
+        self.cluster_target_dir_line_edit.setText(native_path)
 
     def set_source_file(self, path: str, file_id: int):
-        self.source_file_path = path
+        # 确保传入的任何路径都被规范化
+        native_path = os.path.normpath(path) if path else ""
+        self.source_file_path = native_path
         self.source_file_id = file_id
-        self.source_file_line_edit.setText(path)
+        self.source_file_line_edit.setText(native_path)
 
     def display_similar_results(self, results: List[Dict[str, Any]]):
         self.similar_results_table.setRowCount(0)
@@ -182,10 +203,11 @@ class AnalysisClusterTab(QWidget):
             checkbox_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
             checkbox_item.setCheckState(Qt.CheckState.Unchecked)
             
-            path_item = QTableWidgetItem(item_data["path"])
+            # 确保显示的路径也是原生格式
+            native_path = os.path.normpath(item_data["path"])
+            path_item = QTableWidgetItem(native_path)
             score_item = QTableWidgetItem(f"{item_data['score']:.4f}")
 
-            # 将文档 ID 存入路径单元格以便导出
             path_item.setData(Qt.ItemDataRole.UserRole, item_data["id"])
 
             self.similar_results_table.setItem(row, 0, checkbox_item)

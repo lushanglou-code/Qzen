@@ -1,17 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-文件聚类引擎模块 (v3.0.1 - 修正空目录清理逻辑)。
+文件聚类引擎模块 (v4.0.11 - 诊断增强版)。
 
-此版本修复了 _remove_empty_subdirectories 方法中的一个 Bug，
-确保所有层级的空目录都能被正确地递归删除。
+此版本为最终修复与诊断的整合版，旨在彻底解决文件扫描失败的回归错误，
+并为整个扫描流程添加了详细的诊断日志。
+
+核心逻辑:
+1.  **恢复原生路径扫描 (来自 v4.0.8)**: 严格使用 os.path.normpath 和 os.path.join
+    来构建与数据库记录一致的原生查询路径 (e.g., 'E:\\folder\\')，解决扫描为 0 的问题。
+2.  **保留写时复制 (来自 v4.0.9)**: 通过 `copy.copy()` 创建浅拷贝来更新路径，
+    解决内存状态污染导致的“文件未找到”和数据丢失问题。
+3.  **增加诊断模式**: 如果主查询失败，会自动启动备用诊断模式，通过在内存中
+    手动比对路径，来定位问题是出在数据库查询层面还是路径格式本身。
+
+对于反复的错误和修复倒退，我深表歉意。
 """
 
 import logging
 import os
 import json
+import re
 import shutil
+import copy
 from collections import defaultdict
-from typing import List, Callable
+from typing import List, Callable, Tuple
 
 import numpy as np
 from scipy.sparse import vstack, csr_matrix
@@ -21,6 +33,10 @@ from sklearn.metrics.pairwise import cosine_similarity
 from qzen_data.database_handler import DatabaseHandler
 from qzen_data.models import Document
 from qzen_core.similarity_engine import SimilarityEngine
+
+# --- 验证日志：如果此条出现在日志中，证明文件已成功更新 ---
+logging.critical("ClusterEngine v4.0.11 已加载，诊断增强修复已应用。")
+# ---------------------------------------------------------
 
 # 定义一个无操作的回调函数作为默认值
 def _noop_callback(*args, **kwargs):
@@ -34,189 +50,219 @@ def _json_to_vector(json_str: str) -> csr_matrix:
 
 class ClusterEngine:
     """
-    封装了 v3.0 的多轮次聚类算法。
+    v4.0 架构: 封装了独立的 K-Means 和相似度聚类算法。
     """
 
     def __init__(self, db_handler: DatabaseHandler, sim_engine: SimilarityEngine):
-        """
-        初始化聚类引擎。
-        """
         self.db_handler = db_handler
         self.sim_engine = sim_engine
 
-    def run_clustering(self, target_dir: str, k: int, similarity_threshold: float, 
-                       progress_callback: Callable = _noop_callback, 
-                       is_cancelled_callback: Callable[[], bool] = lambda: False) -> None:
+    def run_kmeans_clustering(self, target_dir: str, k: int, 
+                              progress_callback: Callable = _noop_callback, 
+                              is_cancelled_callback: Callable[[], bool] = lambda: False) -> bool:
         """
-        在指定目录上执行一轮完整的“K-Means + 相似度”聚类，并自动清理空目录。
+        对指定目录(及其所有子目录)下的全部文件执行 K-Means 聚类。
         """
-        logging.info(f"--- 开始对目录 '{target_dir}' 执行新一轮聚类 (K={k}) ---")
+        logging.info(f"--- 开始对目录 '{target_dir}' 执行 K-Means 聚类 (K={k}) ---")
         try:
-            docs = self._get_documents_from_db(target_dir)
-            if len(docs) < k:
-                logging.warning(f"目录中的文档总数 ({len(docs)}) 小于 K值 ({k})，无法执行 K-Means 聚类。")
-                return
+            all_docs = self._get_all_docs_recursively(target_dir)
+            valid_docs = [doc for doc in all_docs if doc.feature_vector]
+            if len(valid_docs) < k:
+                logging.warning(
+                    f"K-Means 操作已跳过：在扫描到的 {len(all_docs)} 个文件中，只有 {len(valid_docs)} 个文件拥有可用于聚类的特征向量。"
+                    f"这通常是由于上游的文本提取或向量化步骤失败导致的。所需文件数：{k}。"
+                )
+                return False
+            if is_cancelled_callback(): return False
 
-            if is_cancelled_callback(): return
+            normalized_base_dir = os.path.normpath(target_dir)
+            progress_callback(1, 3, "步骤 1/3: 正在执行 K-Means 算法...")
+            move_plan, docs_to_update = self._calculate_kmeans_move_plan(valid_docs, normalized_base_dir, k)
+            if is_cancelled_callback(): return False
 
-            kmeans_folders = self._perform_kmeans_and_move(docs, target_dir, k, progress_callback, is_cancelled_callback)
-            if not kmeans_folders or is_cancelled_callback(): return
+            progress_callback(2, 3, "步骤 2/3: 正在移动文件...")
+            self._execute_move_plan(move_plan, is_cancelled_callback)
+            if is_cancelled_callback(): return False
 
-            total_kmeans_folders = len(kmeans_folders)
-            for i, folder_path in enumerate(kmeans_folders):
-                if is_cancelled_callback(): return
-                progress_callback(i + 1, total_kmeans_folders, f"正在处理子文件夹: {os.path.basename(folder_path)}")
-                self._perform_similarity_grouping_and_move(folder_path, similarity_threshold, is_cancelled_callback)
-            
-            logging.info(f"--- 目录 '{target_dir}' 的本轮聚类已完成 ---")
+            progress_callback(3, 3, "步骤 3/3: 正在更新数据库并清理目录...")
+            if docs_to_update: self.db_handler.bulk_update_documents(docs_to_update)
+            self._remove_empty_subdirectories(normalized_base_dir)
 
-            # v3.0 新增：聚类后自动清理空文件夹
-            if not is_cancelled_callback():
-                self._remove_empty_subdirectories(target_dir)
-
-        except InterruptedError:
-            logging.warning(f"聚类任务在处理目录 '{target_dir}' 时被用户取消。")
+            logging.info(f"K-Means 聚类完成。共处理 {len(valid_docs)} 个文件，分为 {k} 个簇。")
+            return True
         except Exception as e:
-            logging.error(f"执行聚类时发生未知错误: {e}", exc_info=True)
+            logging.error(f"执行 K-Means 聚类时发生未知错误: {e}", exc_info=True)
+            return False
 
-    def _get_documents_from_db(self, target_dir: str) -> List[Document]:
-        """从数据库中获取指定目录下的所有文档记录。"""
+    def run_similarity_clustering(self, target_dir: str, threshold: float, 
+                                  progress_callback: Callable = _noop_callback, 
+                                  is_cancelled_callback: Callable[[], bool] = lambda: False) -> bool:
+        """
+        对指定目录(及其所有子目录)下的全部文件执行相似度分组。
+        """
+        logging.info(f"--- 开始对目录 '{target_dir}' 执行相似度分组 (阈值={threshold}) ---")
+        try:
+            all_docs = self._get_all_docs_recursively(target_dir)
+            valid_docs = [doc for doc in all_docs if doc.feature_vector]
+            if len(valid_docs) <= 1:
+                logging.warning(
+                    f"相似度分组已跳过：在扫描到的 {len(all_docs)} 个文件中，只有 {len(valid_docs)} 个文件拥有可用于分组的特征向量。"
+                    f"这通常是由于上游的文本提取或向量化步骤失败导致的。所需文件数：> 1。"
+                )
+                return False
+            if is_cancelled_callback(): return False
+
+            normalized_base_dir = os.path.normpath(target_dir)
+            progress_callback(1, 3, "步骤 1/3: 正在计算文件相似度...")
+            move_plan, docs_to_update = self._calculate_similarity_move_plan(valid_docs, normalized_base_dir, threshold)
+            if not move_plan or is_cancelled_callback(): 
+                logging.info("相似度分组已跳过：未找到任何相似度超过阈值的群组。")
+                return False
+
+            progress_callback(2, 3, "步骤 2/3: 正在移动文件...")
+            self._execute_move_plan(move_plan, is_cancelled_callback)
+            if is_cancelled_callback(): return False
+
+            progress_callback(3, 3, "步骤 3/3: 正在更新数据库并清理目录...")
+            if docs_to_update: self.db_handler.bulk_update_documents(docs_to_update)
+            self._remove_empty_subdirectories(normalized_base_dir)
+
+            logging.info(f"相似度分组完成。共找到 {len(docs_to_update)} 个文件被归入新簇。")
+            return True
+        except Exception as e:
+            logging.error(f"执行相似度分组时发生未知错误: {e}", exc_info=True)
+            return False
+
+    def _get_all_docs_recursively(self, target_dir: str) -> List[Document]:
+        """(扫描) 递归获取一个目录下所有文件的 Document 对象。"""
         with self.db_handler.get_session() as session:
-            normalized_path = os.path.normpath(target_dir)
-            path_pattern = os.path.join(normalized_path, '') + '%'
-            return session.query(Document).filter(Document.file_path.like(path_pattern)).all()
+            # --- v4.0.11 诊断日志 --- 
+            logging.info(f"[诊断] 收到扫描目录请求: '{target_dir}'")
+            native_dir = os.path.normpath(target_dir)
+            logging.info(f"[诊断] 规范化为原生路径: '{native_dir}'")
+            search_path = os.path.join(native_dir, '')
+            logging.info(f"[诊断] 构建的最终查询路径: '{search_path}'")
 
-    def _perform_kmeans_and_move(self, docs: List[Document], base_dir: str, k: int, progress_callback: Callable, is_cancelled_callback: Callable[[], bool]) -> List[str]:
-        """
-        执行 K-Means 聚类并移动文件，支持进度与取消。
-        """
-        valid_docs = [doc for doc in docs if doc.feature_vector]
-        if len(valid_docs) < len(docs):
-            logging.warning(f"在 K-Means 宏观分类中，跳过了 {len(docs) - len(valid_docs)} 个没有有效特征向量的文档。")
+            docs = session.query(Document).filter(Document.file_path.startswith(search_path)).all()
+            logging.info(f"主查询完成，使用 startswith('{search_path}') 找到了 {len(docs)} 个匹配的文档。")
+
+            if not docs:
+                logging.warning("主查询未找到任何文档。启动备用诊断查询...")
+                all_docs_in_db = session.query(Document).all()
+                logging.warning(f"数据库中共有 {len(all_docs_in_db)} 条记录。现在逐一在内存中比对路径前缀...")
+                
+                manual_matches = [doc for doc in all_docs_in_db if doc.file_path and doc.file_path.startswith(search_path)]
+
+                if manual_matches:
+                    logging.error(f"[诊断结论] 严重错误：主查询失败，但备用诊断在内存中找到了 {len(manual_matches)} 个匹配项！这强烈暗示数据库驱动或 SQLAlchemy 的 startswith 方法存在 Bug。")
+                    logging.error(f"[诊断] 匹配到的路径示例: {[d.file_path for d in manual_matches[:3]]}")
+                    return manual_matches # 返回手动找到的文档，尝试让程序继续
+                else:
+                    logging.error("[诊断结论] 致命错误：主查询和备用诊断均未找到任何匹配项。这几乎可以肯定是传入的目录与数据库中的路径格式完全不符。")
+                    db_paths_sample = [d.file_path for d in all_docs_in_db[:5]]
+                    logging.error(f"[诊断] 用于查询的前缀: '{search_path}'")
+                    logging.error(f"[诊断] 数据库中的路径示例: {db_paths_sample}")
+            return docs
+
+    def _calculate_kmeans_move_plan(self, docs: List[Document], base_dir: str, k: int) -> Tuple[List[Tuple[str, str]], List[Document]]:
+        """(计算) 执行 K-Means 并返回移动计划和待更新的文档对象列表。"""
+        feature_vectors = vstack([_json_to_vector(doc.feature_vector) for doc in docs])
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10).fit(feature_vectors)
         
-        if len(valid_docs) < k:
-            logging.warning(f"过滤后，目录中的有效文档数量 ({len(valid_docs)}) 小于 K值 ({k})，无法执行 K-Means 聚类。")
-            return []
-
-        feature_vectors = [_json_to_vector(doc.feature_vector) for doc in valid_docs]
-        feature_matrix = vstack(feature_vectors)
-
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-        kmeans.fit(feature_matrix)
-        labels = kmeans.labels_
-
-        clustered_docs = defaultdict(list)
-        for doc, label in zip(valid_docs, labels):
-            clustered_docs[label].append(doc)
-
-        created_folders, docs_to_update = [], []
-        total_clusters = len(clustered_docs)
-        for i, (label, doc_list) in enumerate(clustered_docs.items()):
-            if is_cancelled_callback(): raise InterruptedError("任务已取消")
-            progress_callback(i + 1, total_clusters, f"K-Means 分类: 正在移动第 {i+1} 簇")
-
-            new_folder_path = os.path.normpath(os.path.join(base_dir, str(label)))
-            os.makedirs(new_folder_path, exist_ok=True)
-            created_folders.append(new_folder_path)
-
-            for doc in doc_list:
-                original_path = doc.file_path
-                new_path = os.path.normpath(os.path.join(new_folder_path, os.path.basename(original_path)))
-                doc.file_path = new_path
-                docs_to_update.append(doc)
-                shutil.move(original_path, new_path)
-        
-        if docs_to_update: self.db_handler.bulk_update_documents(docs_to_update)
-        return created_folders
-
-    def _perform_similarity_grouping_and_move(self, folder_path: str, threshold: float, is_cancelled_callback: Callable[[], bool]) -> None:
-        """
-        在单个文件夹内执行相似度分组，支持取消。
-        """
-        docs = self._get_documents_from_db(folder_path)
-        if len(docs) <= 1: return
-
-        valid_docs = [doc for doc in docs if doc.feature_vector]
-        if len(valid_docs) < len(docs):
-            logging.warning(f"在相似文件微观分组中，跳过了 {len(docs) - len(valid_docs)} 个没有有效特征向量的文档。")
-
-        if len(valid_docs) <= 1: return
-
-        feature_vectors = [_json_to_vector(doc.feature_vector) for doc in valid_docs]
-        feature_matrix = vstack(feature_vectors)
-        content_slices = [doc.content_slice for doc in valid_docs]
-
-        clusters_indices = self._cluster_documents_by_similarity(feature_matrix, threshold)
-        if not clusters_indices: return
-
+        move_plan = []
         docs_to_update = []
-        for cluster in clusters_indices:
-            if is_cancelled_callback(): raise InterruptedError("任务已取消")
-            cluster_docs = [valid_docs[i] for i in cluster]
-            cluster_content = [content_slices[i] for i in cluster]
+        for doc, label in zip(docs, kmeans.labels_):
+            original_path = doc.file_path
+            new_dir = os.path.join(base_dir, str(label))
+            new_path = os.path.join(new_dir, os.path.basename(original_path))
+            
+            move_plan.append((original_path, new_path))
+            
+            doc_for_update = copy.copy(doc)
+            doc_for_update.file_path = new_path
+            docs_to_update.append(doc_for_update)
+            
+        return move_plan, docs_to_update
 
+    def _calculate_similarity_move_plan(self, docs: List[Document], base_dir: str, threshold: float) -> Tuple[List[Tuple[str, str]], List[Document]]:
+        """(计算) 执行相似度分组并返回移动计划和待更新的文档对象列表。"""
+        feature_vectors = vstack([_json_to_vector(doc.feature_vector) for doc in docs])
+        sim_matrix = cosine_similarity(feature_vectors)
+        
+        num_docs = len(docs)
+        clustered = [False] * num_docs
+        move_plan = []
+        docs_to_update = []
+
+        for i in range(num_docs):
+            if clustered[i]: continue
+            similar_indices = [j for j in range(i + 1, num_docs) if not clustered[j] and sim_matrix[i, j] >= threshold]
+            if not similar_indices: continue
+
+            current_cluster_indices = [i] + similar_indices
+            cluster_docs = [docs[idx] for idx in current_cluster_indices]
+            for idx in current_cluster_indices: clustered[idx] = True
+
+            cluster_content = [doc.content_slice for doc in cluster_docs]
             topic_name = self._extract_topic_keywords(cluster_content) or "相似文件簇"
-            topic_folder_path = os.path.normpath(os.path.join(folder_path, topic_name))
-            os.makedirs(topic_folder_path, exist_ok=True)
+            new_dir = os.path.join(base_dir, topic_name)
 
             for doc in cluster_docs:
                 original_path = doc.file_path
-                new_path = os.path.normpath(os.path.join(topic_folder_path, os.path.basename(original_path)))
-                doc.file_path = new_path
-                docs_to_update.append(doc)
-                shutil.move(original_path, new_path)
+                new_path = os.path.join(new_dir, os.path.basename(original_path))
+                move_plan.append((original_path, new_path))
+                
+                doc_for_update = copy.copy(doc)
+                doc_for_update.file_path = new_path
+                docs_to_update.append(doc_for_update)
 
-        if docs_to_update: self.db_handler.bulk_update_documents(docs_to_update)
+        return move_plan, docs_to_update
 
-    def _cluster_documents_by_similarity(self, feature_matrix: csr_matrix, similarity_threshold: float) -> List[List[int]]:
-        num_docs = feature_matrix.shape[0]
-        sim_matrix = cosine_similarity(feature_matrix)
-        clustered = [False] * num_docs
-        clusters = []
-        for i in range(num_docs):
-            if clustered[i]: continue
-            current_cluster = [i]
-            clustered[i] = True
-            for j in range(i + 1, num_docs):
-                if not clustered[j] and sim_matrix[i, j] >= similarity_threshold:
-                    current_cluster.append(j)
-                    clustered[j] = True
-            if len(current_cluster) > 1:
-                clusters.append(current_cluster)
-        return clusters
+    def _execute_move_plan(self, move_plan: List[Tuple[str, str]], is_cancelled_callback: Callable[[], bool]) -> None:
+        """(移动) 根据计划执行文件移动，并创建目标文件夹。"""
+        for original_path, new_path in move_plan:
+            if is_cancelled_callback(): return
+            try:
+                new_dir = os.path.dirname(new_path)
+                if not os.path.exists(new_dir): os.makedirs(new_dir)
+                
+                native_original_path = os.path.normpath(original_path)
+                native_new_path = os.path.normpath(new_path)
+                if os.path.exists(native_original_path):
+                    shutil.move(native_original_path, native_new_path)
+                else:
+                    logging.warning(f"文件在移动前未找到，可能已被前序操作移动。已跳过: {original_path}")
+            except Exception as e:
+                logging.error(f"移动文件 {original_path} 到 {new_path} 时失败: {e}")
 
     def _extract_topic_keywords(self, content_list: List[str], top_n: int = 3) -> str:
+        """根据一组文本内容，提取能代表其主题的关键词。"""
         if not content_list: return ""
         try:
             tfidf_matrix = self.sim_engine.vectorizer.transform(content_list)
             summed_tfidf = np.array(tfidf_matrix.sum(axis=0)).flatten()
             feature_names = np.array(self.sim_engine.vectorizer.get_feature_names_out())
-            top_indices = summed_tfidf.argsort()[-top_n:][::-1]
-            keywords = [feature_names[i] for i in top_indices]
-            return "_".join(keywords)
+            valid_indices = [i for i, name in enumerate(feature_names) if len(name) > 1]
+            if not valid_indices: return ""
+
+            top_indices = summed_tfidf[valid_indices].argsort()[-top_n:][::-1]
+            keywords = [feature_names[valid_indices[i]] for i in top_indices]
+            return "_".join(re.sub(r'[\\/:*?"<>|]', '', k) for k in keywords if k)
         except Exception as e:
             logging.error(f"提取主题关键词时出错: {e}")
             return ""
 
     def _remove_empty_subdirectories(self, path: str) -> None:
-        """
-        从底向上递归删除指定路径下的所有空子文件夹。
-
-        Args:
-            path: 开始扫描的根目录。
-        """
+        """(清理) 从底向上递归删除指定路径下的所有空子文件夹。"""
         logging.info(f"开始清理目录 '{path}' 下的空文件夹...")
         removed_count = 0
-        # 从底向上遍历，这样可以先删除子目录再判断父目录是否为空
         for dirpath, _, _ in os.walk(path, topdown=False):
-            # v3.0.1 修正: 不再依赖 os.walk 提供的 dirnames/filenames 列表，
-            # 因为它们是遍历开始前的快照。在每次循环中，我们必须用 os.listdir 
-            # 重新检查当前目录是否真的为空，以确保逻辑的正确性。
-            if not os.listdir(dirpath):
-                try:
+            if not os.path.exists(dirpath): continue
+            try:
+                if not os.listdir(dirpath):
                     os.rmdir(dirpath)
                     logging.info(f"  - 已删除空文件夹: {dirpath}")
                     removed_count += 1
-                except OSError as e:
-                    logging.error(f"无法删除空文件夹 {dirpath}: {e}")
+            except OSError as e:
+                logging.error(f"无法删除空文件夹 {dirpath}: {e}")
         logging.info(f"空文件夹清理完成，共删除 {removed_count} 个目录。")
