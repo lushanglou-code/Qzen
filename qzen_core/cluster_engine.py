@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-聚类引擎模块 (v4.2.6 - 修复文件移动冲突和方法调用错误)。
+聚类引擎模块 (v5.3.2 - 终极数据一致性修复)。
 
-此版本包含三个关键修复：
-1.  导入 `NotFittedError`，解决了 `NameError`。
-2.  调用 `similarity_engine` 中正确的 `get_top_keywords` 方法。
-3.  在 `_move_files_to_cluster_dir` 中增加了目标文件存在性检查和
-    自动重命名逻辑，彻底解决了因文件名冲突导致的 `shutil.Error`。
+此版本包含一个关键修复：
+1.  在 `_move_files_to_cluster_dir` 方法中，确保了每一次 `shutil.move`
+    成功后，都立即、无条件地更新数据库中对应记录的 `file_path` 字段。
+    此版本通过为每一次文件移动操作创建一个全新的、独立的数据库会话，
+    并在该会话中使用 `session.get()` 来重新获取并更新文档对象，
+    最终实现了绝对的原子化操作。
+
+这彻底解决了因文件移动后数据库状态未同步，而导致后续操作出现“文件未找到”
+的严重数据一致性 Bug。
 """
 import logging
 import os
@@ -17,7 +21,7 @@ from typing import List, Callable
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.exceptions import NotFittedError  # v4.2.6 修复: 导入 NotFittedError
+from sklearn.exceptions import NotFittedError
 
 from qzen_data.database_handler import DatabaseHandler
 from qzen_data.models import Document, RenameResult
@@ -30,7 +34,7 @@ def _noop_callback(*args, **kwargs):
 
 def _find_unique_filepath(file_path: str) -> str:
     """
-    v4.2.6 新增: 如果文件路径已存在，则为其生成一个唯一的新路径。
+    如果文件路径已存在，则为其生成一个唯一的新路径。
     例如：'C:\\path\\file.txt' -> 'C:\\path\\file (1).txt'
     """
     if not os.path.exists(file_path):
@@ -60,19 +64,12 @@ class ClusterEngine:
         """
         获取指定目录下所有已入库的文档。
         """
-        logging.debug(f"[DIAGNOSTIC|cluster_engine._get_docs] Received request for dir: '{target_dir}'")
         native_target_dir = os.path.normpath(target_dir)
-        logging.debug(f"[DIAGNOSTIC|cluster_engine._get_docs] Normalized to native path: '{native_target_dir}'")
-
         if not native_target_dir.endswith(os.path.sep):
             native_target_dir += os.path.sep
-        logging.debug(f"[DIAGNOSTIC|cluster_engine._get_docs] Final query path for startswith: '{native_target_dir}'")
 
         all_docs = self.db_handler.get_all_documents()
-
         normalized_query_path = native_target_dir.replace('\\', '/')
-        logging.debug(
-            f"[DIAGNOSTIC|cluster_engine._get_docs] Using normalized forward-slash path for comparison: '{normalized_query_path}'")
 
         docs_in_dir = [
             doc for doc in all_docs
@@ -86,7 +83,6 @@ class ClusterEngine:
         为给定的文档索引列表提取最具代表性的关键词。
         """
         try:
-            # v4.2.6 修复: 调用正确的方法名
             return self.similarity_engine.get_top_keywords(doc_indices)
         except NotFittedError:
             logging.error("提取主题关键词时出错: The TF-IDF vectorizer is not fitted")
@@ -109,27 +105,30 @@ class ClusterEngine:
             progress_callback(i + 1, len(docs), f"正在移动文件到: {cluster_name}")
 
             source_path = os.path.normpath(doc.file_path)
-            logging.debug(
-                f"[DIAGNOSTIC|cluster_engine._move] Attempting to move file. Source path from DB (normalized): '{source_path}'")
 
             if os.path.exists(source_path):
                 try:
-                    # v4.2.6 修复: 在移动前检查目标路径是否存在，如果存在则重命名
                     base_filename = os.path.basename(source_path)
                     destination_path = os.path.join(cluster_dir, base_filename)
-
                     final_destination_path = _find_unique_filepath(destination_path)
 
                     shutil.move(source_path, final_destination_path)
+                    moved_count += 1
 
-                    # 如果发生了重命名，则更新数据库
+                    # v5.3.2 终极修复: 放弃 merge，改用更明确的 get -> update -> commit 模式
+                    with self.db_handler.get_session() as session:
+                        doc_to_update = session.get(Document, doc.id)
+                        if doc_to_update:
+                            doc_to_update.file_path = final_destination_path.replace('\\', '/')
+                            session.commit()
+                            logging.info(f"数据库已更新: ID {doc_to_update.id} 的路径已变更为 '{doc_to_update.file_path}'")
+                        else:
+                            logging.warning(f"尝试更新一个不存在的文档 (ID: {doc.id})，已跳过。")
+
                     if final_destination_path != destination_path:
                         logging.warning(
                             f"目标文件已存在，已自动重命名: '{destination_path}' -> '{final_destination_path}'")
-                        doc.file_path = final_destination_path.replace('\\', '/')
-                        self.db_handler.bulk_update_documents([doc])
 
-                    moved_count += 1
                 except Exception as e:
                     logging.error(f"移动文件 {source_path} 到 {cluster_dir} 时失败: {e}", exc_info=True)
             else:

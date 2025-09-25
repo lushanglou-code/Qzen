@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-数据库操作模块 (v5.0 - MySQL 迁移)。
+数据库操作模块 (v5.3.3 - 修复路径查询问题)。
 
-此版本根据 v5.0 的架构文档，将数据库后端从 DM8 迁移到 MySQL 8.0。
+此版本修正了 `get_document_by_path` 方法中的一个严重 Bug。
 
 核心修复：
-1.  **废弃所有手动 DDL**: 移除了所有为 DM8 编写的、复杂的、三阶段原子化的
-    `recreate_tables` 逻辑。
-2.  **恢复标准实践**: 改为使用 SQLAlchemy 官方推荐的、跨数据库兼容的
-    `Base.metadata.drop_all()` 和 `Base.metadata.create_all()` 方法。
+1.  **统一路径标准化**: 废弃了错误的 `os.path.normpath()`，改为使用
+    与项目中其他部分一致的 `replace('\\', '/')` 方法来将查询路径
+    标准化为正斜杠格式。
+2.  **不区分大小写查询**: 在路径比较时，强制使用 `LOWER()` SQL 函数，
+    以消除因文件系统或用户输入的大小写不一致而导致的查询失败问题。
 
-这使得数据库操作更简洁、更健壮，并完全拥抱新选择的 MySQL 技术栈。
+这确保了从文件对话框获取的路径能够与数据库中存储的、使用正斜杠
+的权威路径正确匹配，彻底解决了“相似文件搜索”模块中文件无法被
+找到的问题。
 """
 
 from datetime import datetime, timezone
@@ -19,7 +22,7 @@ import logging
 import os
 from typing import Generator, List, Optional
 
-from sqlalchemy import create_engine, NullPool, StaticPool, text
+from sqlalchemy import create_engine, NullPool, StaticPool, text, func
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.engine import Engine
 
@@ -46,7 +49,6 @@ class DatabaseHandler:
         """
         if self._engine is None:
             engine_opts = {}
-            # v5.0 迁移: 移除所有 DM8 特定的连接参数
             connect_args = {}
 
             if self._db_url.startswith("sqlite:///"):
@@ -96,7 +98,6 @@ class DatabaseHandler:
         engine = self._get_engine()
         logging.info("正在使用 SQLAlchemy 标准方法初始化数据库...")
         try:
-            # 使用 SQLAlchemy 的标准方法，它能正确处理跨数据库的依赖关系
             Base.metadata.drop_all(engine)
             Base.metadata.create_all(engine)
             logging.info("数据库初始化完成，所有表已成功重建。")
@@ -123,11 +124,13 @@ class DatabaseHandler:
 
     def get_document_by_path(self, file_path: str) -> Optional[Document]:
         """
-        获取指定绝对路径的单个 Document 记录。
+        v5.3.3 修复: 获取指定绝对路径的单个 Document 记录。
         """
-        normalized_path = os.path.normpath(file_path)
+        # 关键修复：必须将路径标准化为与数据库中存储的格式（正斜杠）一致
+        # 并且使用不区分大小写的比较，以应对各种来源的路径字符串
+        normalized_path = file_path.replace('\\', '/')
         with self.get_session() as session:
-            return session.query(Document).filter(Document.file_path == normalized_path).first()
+            return session.query(Document).filter(func.lower(Document.file_path) == func.lower(normalized_path)).first()
 
     def get_document_by_hash(self, file_hash: str) -> Optional[Document]:
         """

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Qzen 主窗口模块 (v5.1.2 - 强制重编译)。
+Qzen 主窗口模块 (v5.1.3 - 强制重编译)。
 
-此版本通过添加注释来强制 Python 解释器重新编译文件，
+此版本通过添加一个虚拟方法来强制 Python 解释器重新编译文件，
 以解决因缓存 (.pyc) 问题而导致的、已修复的导入错误反复出现的问题。
 """
 
@@ -17,7 +17,6 @@ from PyQt6.QtWidgets import (
     QFileDialog, QProgressBar, QTabWidget, QPushButton
 )
 from PyQt6.QtGui import QAction, QCloseEvent
-# v5.1.2: 强制 Python 重新编译以加载正确的 PyQt6 路径
 from PyQt6.QtCore import pyqtSignal
 
 # --- v4.0.0 架构引入 ---
@@ -63,6 +62,7 @@ class MainWindow(QMainWindow):
         self._update_tab_states()
 
         self.progress_signal.connect(self.update_progress)
+        self._force_recompile_workaround() # v5.1.3: Call dummy method
 
     def _create_menus(self):
         menu_bar = self.menuBar()
@@ -354,3 +354,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setMaximum(max_value)
         self.progress_bar.setValue(current_value)
         self.setWindowTitle(f"Qzen (千针) v5.1 - {status_text}")
+
+    def _force_recompile_workaround(self):
+        """ v5.1.3: This dummy method forces a recompile to avoid .pyc cache issues. """
+        pass
