@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-业务流程协调器模块 (v4.0.1 - 路径规范化修复)。
+业务流程协调器模块 (v4.3.1 - 修复引擎预热与数据摄取逻辑)。
 
-此版本修复了从 UI 接收到的路径格式不一致的问题。
-之前，UI 传递的路径可能使用正斜杠 (e.g., 'E:/folder')，而数据库中存储的是
-原生反斜杠路径 (e.g., 'E:\\folder')。这会导致在上游的预热和查询步骤中
-因路径不匹配而失败。
-
-本次修复在所有接收目录路径的业务逻辑入口（如 `run_kmeans_clustering`）
-处，立即使用 `os.path.normpath()` 将路径转换为当前操作系统的原生格式，
-确保了整个处理链条中路径格式的统一和正确性。
+此版本包含两个关键修复：
+1.  **修复引擎预热逻辑**: 在 `prime_similarity_engine` 中，除了加载预计算的
+    特征向量外，还重新加载了文档的内容切片来重新训练 (fit) TF-IDF 模型。
+    这彻底解决了在聚类时因模型未训练而导致的 `NotFittedError`。
+2.  **修复数据摄取逻辑**: 实现了“扁平化、去重、重命名”策略，确保了
+    中间数据源的绝对干净，为所有后续操作提供了可靠的基础。
 """
 
 import logging
@@ -45,6 +43,25 @@ def _json_to_vector(json_str: str) -> csr_matrix:
     data = json.loads(json_str)
     return csr_matrix((data['data'], data['indices'], data['indptr']), shape=data['shape'])
 
+
+def _get_unique_filepath(destination_path: str) -> str:
+    """
+    v4.3 新增: 检查文件路径是否存在，如果存在，则附加 _dupN 后缀。
+    """
+    if not os.path.exists(destination_path):
+        return destination_path
+
+    directory, filename = os.path.split(destination_path)
+    name, ext = os.path.splitext(filename)
+    counter = 1
+    while True:
+        new_name = f"{name}_dup{counter}{ext}"
+        new_path = os.path.join(directory, new_name)
+        if not os.path.exists(new_path):
+            logging.warning(f"检测到文件名冲突。原始路径 '{destination_path}' 已存在。将重命名为 '{new_path}'")
+            return new_path
+        counter += 1
+
 def handle_remove_readonly(func, path, exc_info):
     """
     shutil.rmtree 的错误处理程序，用于处理只读文件导致的权限错误。
@@ -56,11 +73,14 @@ def handle_remove_readonly(func, path, exc_info):
     else:
         raise
 
+
 class Orchestrator:
     """
     协调各个模块以完成复杂的业务流程。
     """
-    def __init__(self, db_handler: database_handler.DatabaseHandler, max_features: int, slice_size_kb: int, custom_stopwords: List[str] = None):
+
+    def __init__(self, db_handler: database_handler.DatabaseHandler, max_features: int, slice_size_kb: int,
+                 custom_stopwords: List[str] = None):
         """
         初始化 Orchestrator。
         """
@@ -94,9 +114,12 @@ class Orchestrator:
                 raise
         os.makedirs(intermediate_path, exist_ok=True)
 
-    def run_deduplication_core(self, source_path: str, intermediate_path: str, allowed_extensions: Set[str], progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> Tuple[str, List[DeduplicationResult]]:
+    def run_deduplication_core(self, source_path: str, intermediate_path: str, allowed_extensions: Set[str],
+                               progress_callback: Callable,
+                               is_cancelled_callback: Callable[[], bool] = lambda: False) -> Tuple[
+        str, List[DeduplicationResult]]:
         """
-        执行核心的去重与预处理流程。
+        v4.3 重构: 执行“扁平化、去重、重命名”的数据摄取核心流程。
         """
         task_run = self.db_handler.create_task_run(task_type='deduplication')
         files_to_scan = list(file_handler.scan_files(source_path, allowed_extensions))
@@ -104,41 +127,61 @@ class Orchestrator:
         processed_hashes, new_docs_to_save, deduplication_results, skipped_files = {}, [], [], []
 
         for i, file_path in enumerate(files_to_scan):
-            if is_cancelled_callback():
-                logging.info("去重任务被用户取消。")
-                return "任务已取消", []
-            progress_callback(i + 1, total_files, f"扫描文件: {os.path.basename(file_path)}")
-            file_hash = file_handler.calculate_file_hash(file_path)
-            if file_hash and file_hash not in processed_hashes:
-                processed_hashes[file_hash] = file_path
-                destination_path = os.path.normpath(os.path.join(intermediate_path, os.path.relpath(file_path, source_path)))
-                os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-                try:
-                    shutil.copy2(file_path, destination_path)
-                    content_slice = file_handler.get_content_slice(destination_path, self.slice_size_kb)
+            try:
+                if is_cancelled_callback():
+                    logging.info("去重任务被用户取消。")
+                    return "任务已取消", []
+
+                progress_callback(i + 1, total_files, f"扫描文件: {os.path.basename(file_path)}")
+
+                # 第一步：基于内容摘要去重
+                content_slice = file_handler.get_content_slice(file_path)
+                if not content_slice:
+                    logging.warning(f"无法为文件 {file_path} 生成内容摘要，已跳过。")
+                    continue
+
+                content_hash = file_handler.calculate_content_hash(content_slice)
+
+                if content_hash and content_hash not in processed_hashes:
+                    processed_hashes[content_hash] = file_path
+
+                    # 第二步：扁平化复制与冲突重命名
+                    base_filename = os.path.basename(file_path)
+                    destination_path = os.path.join(intermediate_path, base_filename)
+                    unique_destination_path = _get_unique_filepath(destination_path)
+                    unique_destination_path_normalized = unique_destination_path.replace('\\', '/')
+
+                    shutil.copy2(file_path, unique_destination_path)
+
+                    logging.debug(
+                        f"[DIAGNOSTIC|orchestrator.dedup] Saving to DB with authoritative path: {unique_destination_path_normalized}")
                     new_docs_to_save.append(Document(
-                        file_hash=file_hash, 
-                        file_path=destination_path,
+                        file_hash=content_hash,
+                        file_path=unique_destination_path_normalized,
                         content_slice=content_slice
                     ))
-                except PermissionError:
-                    logging.warning(f"权限错误：无法复制文件 {file_path} 到 {destination_path}，可能文件已被锁定。将跳过此文件。")
-                    skipped_files.append(file_path)
-            elif file_hash:
-                deduplication_results.append(DeduplicationResult(task_run_id=task_run.id, duplicate_file_path=file_path, original_file_hash=file_hash))
+                elif content_hash:
+                    deduplication_results.append(
+                        DeduplicationResult(task_run_id=task_run.id, duplicate_file_path=file_path,
+                                            original_file_hash=content_hash))
+
+            except Exception as e:
+                logging.error(f"处理文件 {file_path} 时发生严重错误，已跳过此文件。", exc_info=True)
+                skipped_files.append(file_path)
 
         if new_docs_to_save: self.db_handler.bulk_insert_documents(new_docs_to_save)
         if deduplication_results: self.db_handler.bulk_insert_deduplication_results(deduplication_results)
-        
+
         self._is_engine_primed = False
         summary = f"去重任务完成！共找到 {len(deduplication_results)} 个重复文件。"
         if skipped_files:
-            summary += f" \n\n警告：有 {len(skipped_files)} 个文件因权限问题被跳过（可能已被其他程序锁定）。"
+            summary += f" \\n\\n警告：有 {len(skipped_files)} 个文件因处理时发生错误而被跳过。请检查日志获取详细信息。"
         summary += " 仅显示前100条，完整结果已存入数据库。" if len(deduplication_results) > 100 else " 详情已存入数据库。"
         self.db_handler.update_task_summary(task_run.id, summary)
         return summary, deduplication_results[:100]
 
-    def run_vectorization(self, progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> str:
+    def run_vectorization(self, progress_callback: Callable,
+                          is_cancelled_callback: Callable[[], bool] = lambda: False) -> str:
         """
         为数据库中尚未处理的文档计算并存储其特征向量。
         """
@@ -147,25 +190,26 @@ class Orchestrator:
 
         content_slices = [(doc.content_slice or "") for doc in docs_to_vectorize]
         feature_matrix = self.similarity_engine.vectorize_documents(content_slices)
-        
+
         for i, doc in enumerate(docs_to_vectorize):
             if is_cancelled_callback():
                 logging.info("向量化任务被用户取消。")
                 return "任务已取消"
             progress_callback(i + 1, len(docs_to_vectorize), f"准备向量: {os.path.basename(doc.file_path)}")
             doc.feature_vector = _vector_to_json(feature_matrix[i])
-            
+
         self.db_handler.bulk_update_documents(docs_to_vectorize)
         self._is_engine_primed = False
         return f"向量化任务已成功完成，处理了 {len(docs_to_vectorize)} 个文档。"
 
-    def prime_similarity_engine(self, force_reload: bool = False, is_cancelled_callback: Callable[[], bool] = lambda: False) -> None:
+    def prime_similarity_engine(self, force_reload: bool = False,
+                                is_cancelled_callback: Callable[[], bool] = lambda: False) -> None:
         """
-        预热相似度引擎，加载所有文档的向量和元数据到 SimilarityEngine。
+        v4.3.1 修复: 预热引擎，加载向量和元数据，并重新训练 TF-IDF 模型。
         """
         if self._is_engine_primed and not force_reload:
             return
-        
+
         logging.info("正在预热相似度引擎...")
         all_docs = self.db_handler.get_all_documents()
         docs_with_vectors = [doc for doc in all_docs if doc.feature_vector]
@@ -176,6 +220,15 @@ class Orchestrator:
             self._is_engine_primed = True
             logging.info("引擎预热完成，但未找到任何已向量化的文档。")
             return
+
+        # v4.3.1 修复: 重新训练 TF-IDF 模型以支持关键词提取
+        logging.info("正在基于现有内容切片重新训练 TF-IDF 模型...")
+        content_slices_for_fitting = [doc.content_slice for doc in docs_with_vectors if doc.content_slice]
+        if content_slices_for_fitting:
+            self.similarity_engine.vectorizer.fit(content_slices_for_fitting)
+            logging.info(f"TF-IDF 模型已在 {len(content_slices_for_fitting)} 个文档上成功再训练。")
+        else:
+            logging.warning("未找到任何内容切片来训练 TF-IDF 模型，关键词提取功能将不可用。")
 
         vectors, doc_map = [], []
         for doc in docs_with_vectors:
@@ -199,39 +252,52 @@ class Orchestrator:
 
         self._is_engine_primed = True
 
-    def find_top_n_similar_for_file(self, target_file_id: int, n: int, is_cancelled_callback: Callable[[], bool] = lambda: False) -> List[Dict[str, Any]]:
+    def find_top_n_similar_for_file(self, target_file_id: int, n: int,
+                                    is_cancelled_callback: Callable[[], bool] = lambda: False) -> List[Dict[str, Any]]:
         """
-        为指定文件 ID 查找最相似的 N 个其他文件。
+        v4.3 修复: 为指定文件 ID 查找最相似的 N 个其他文件。
         """
+        logging.info(f"收到为文件 ID {target_file_id} 查找 {n} 个相似文件的请求。")
         self.prime_similarity_engine(is_cancelled_callback=is_cancelled_callback)
         if is_cancelled_callback() or not self._is_engine_primed or self.similarity_engine.feature_matrix is None:
             return []
 
+        target_doc = self.db_handler.get_document_by_id(target_file_id)
+        if not target_doc:
+            logging.error(f"严重错误：无法在数据库中找到 ID 为 {target_file_id} 的文档。")
+            return []
+
         doc_map = self.similarity_engine.doc_map
-        try:
-            target_index = next(i for i, doc in enumerate(doc_map) if doc['id'] == target_file_id)
-        except StopIteration:
-            logging.warning(f"无法在预热的文档映射中找到文件 ID: {target_file_id}。")
+        target_index = -1
+        for i, doc in enumerate(doc_map):
+            if doc['id'] == target_file_id:
+                target_index = i
+                break
+        
+        if target_index == -1:
+            logging.error(f"严重错误：无法在引擎的文档映射中找到 ID 为 {target_file_id} 的记录。")
             return []
 
         target_vector = self.similarity_engine.feature_matrix[target_index]
         indices, scores = self.similarity_engine.find_top_n_similar(target_vector, n=n)
-        
+
         return [
             {
-                'id': doc_map[i]['id'], 
-                'path': doc_map[i]['file_path'], 
+                'id': doc_map[i]['id'],
+                'path': doc_map[i]['file_path'],
                 'score': score
             } for i, score in zip(indices, scores)
         ]
 
-    def run_kmeans_clustering(self, target_dir: str, k: int, progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> str:
+    def run_kmeans_clustering(self, target_dir: str, k: int, progress_callback: Callable,
+                              is_cancelled_callback: Callable[[], bool] = lambda: False) -> str:
         """
         在指定目录上执行 K-Means 聚类。
         """
         native_target_dir = os.path.normpath(target_dir)
-        logging.info(f"Orchestrator 收到对目录 '{target_dir}' 的 K-Means 聚类请求 (K={k})。已规范化为: '{native_target_dir}'")
-        
+        logging.info(
+            f"Orchestrator 收到对目录 '{target_dir}' 的 K-Means 聚类请求 (K={k})。已规范化为: '{native_target_dir}'")
+
         self.prime_similarity_engine(is_cancelled_callback=is_cancelled_callback)
         if is_cancelled_callback(): return "任务已取消"
         if self.similarity_engine.feature_matrix is None or self.similarity_engine.feature_matrix.shape[0] == 0:
@@ -239,7 +305,8 @@ class Orchestrator:
 
         try:
             task_run = self.db_handler.create_task_run(task_type='kmeans_clustering')
-            success = self.cluster_engine.run_kmeans_clustering(native_target_dir, k, progress_callback, is_cancelled_callback)
+            success = self.cluster_engine.run_kmeans_clustering(native_target_dir, k, progress_callback,
+                                                                is_cancelled_callback)
             if is_cancelled_callback():
                 summary = "K-Means 聚类任务被用户取消。"
             elif success:
@@ -252,12 +319,14 @@ class Orchestrator:
             logging.error(f"在执行 K-Means 聚类时发生意外错误: {e}", exc_info=True)
             return f"K-Means 聚类失败: {e}"
 
-    def run_similarity_clustering(self, target_dir: str, threshold: float, progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> str:
+    def run_similarity_clustering(self, target_dir: str, threshold: float, progress_callback: Callable,
+                                  is_cancelled_callback: Callable[[], bool] = lambda: False) -> str:
         """
         在指定目录上执行相似度分组。
         """
         native_target_dir = os.path.normpath(target_dir)
-        logging.info(f"Orchestrator 收到对目录 '{target_dir}' 的相似度分组请求 (阈值={threshold})。已规范化为: '{native_target_dir}'")
+        logging.info(
+            f"Orchestrator 收到对目录 '{target_dir}' 的相似度分组请求 (阈值={threshold})。已规范化为: '{native_target_dir}'")
 
         self.prime_similarity_engine(is_cancelled_callback=is_cancelled_callback)
         if is_cancelled_callback(): return "任务已取消"
@@ -266,7 +335,8 @@ class Orchestrator:
 
         try:
             task_run = self.db_handler.create_task_run(task_type='similarity_clustering')
-            success = self.cluster_engine.run_similarity_clustering(native_target_dir, threshold, progress_callback, is_cancelled_callback)
+            success = self.cluster_engine.run_similarity_clustering(native_target_dir, threshold, progress_callback,
+                                                                    is_cancelled_callback)
             if is_cancelled_callback():
                 summary = "相似度分组任务被用户取消。"
             elif success:
@@ -279,18 +349,21 @@ class Orchestrator:
             logging.error(f"在执行相似度分组时发生意外错误: {e}", exc_info=True)
             return f"相似度分组失败: {e}"
 
-    def run_filename_search(self, keyword: str, intermediate_path: str, target_path: str, allowed_extensions: Set[str], progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> Tuple[str, List[SearchResult]]:
+    def run_filename_search(self, keyword: str, intermediate_path: str, target_path: str, allowed_extensions: Set[str],
+                            progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> \
+    Tuple[str, List[SearchResult]]:
         """在中间文件夹中按文件名搜索，并将结果存入数据库。"""
         task_run = self.db_handler.create_task_run(task_type='filename_search')
         files_to_scan = list(file_handler.scan_files(intermediate_path, allowed_extensions))
         if not files_to_scan: return "中间文件夹中没有可供搜索的文件。", []
-            
+
         matched_files = [p for p in files_to_scan if keyword.lower() in os.path.basename(p).lower()]
         if not matched_files: return f"没有找到文件名包含 '{keyword}' 的文件。", []
 
-        search_results = [SearchResult(task_run_id=task_run.id, keyword=keyword, matched_file_path=p) for p in matched_files]
+        search_results = [SearchResult(task_run_id=task_run.id, keyword=keyword, matched_file_path=p) for p in
+                          matched_files]
         self.db_handler.bulk_insert_search_results(search_results)
-            
+
         destination_dir = os.path.join(target_path, f"文件名包含_{keyword}")
         os.makedirs(destination_dir, exist_ok=True)
         skipped_files = []
@@ -304,38 +377,40 @@ class Orchestrator:
             except PermissionError:
                 logging.warning(f"权限错误：无法将搜索到的文件 {file_path} 复制到目标目录，可能文件已被锁定。将跳过复制。")
                 skipped_files.append(file_path)
-            
+
         summary = f"文件名搜索完成！共找到并复制了 {len(matched_files)} 个文件。"
         if skipped_files:
-            summary += f" \n\n警告：有 {len(skipped_files)} 个文件因权限问题被跳过（可能已被其他程序锁定）。"
+            summary += f" \\n\\n警告：有 {len(skipped_files)} 个文件因权限问题被跳过（可能已被其他程序锁定）。"
         summary += " 仅显示前100条，完整结果已存入数据库。" if len(matched_files) > 100 else " 详情已存入数据库。"
         self.db_handler.update_task_summary(task_run.id, summary)
         return summary, search_results[:100]
 
-    def run_content_search(self, keyword: str, target_path: str, progress_callback: Callable, is_cancelled_callback: Callable[[], bool] = lambda: False) -> Tuple[str, List[SearchResult]]:
+    def run_content_search(self, keyword: str, target_path: str, progress_callback: Callable,
+                           is_cancelled_callback: Callable[[], bool] = lambda: False) -> Tuple[str, List[SearchResult]]:
         """
         在所有文档的预存内容切片中搜索关键词。
         """
         task_run = self.db_handler.create_task_run(task_type='content_search')
         all_docs = self.db_handler.get_all_documents()
         if not all_docs: return "数据库中没有可供搜索的文档记录。", []
-            
+
         matched_paths = []
         for i, doc in enumerate(all_docs):
             if is_cancelled_callback():
                 logging.info("内容搜索任务被用户取消。")
                 return "任务已取消", []
             progress_callback(i + 1, len(all_docs), f"正在扫描: {os.path.basename(doc.file_path)}")
-            
-            content_slice = doc.content_slice or "" # 确保 content_slice 不为 None
+
+            content_slice = doc.content_slice or ""  # 确保 content_slice 不为 None
             if keyword.lower() in content_slice.lower():
                 matched_paths.append(doc.file_path)
-                
+
         if not matched_paths: return f"没有找到内容包含 '{keyword}' 的文件。", []
 
-        search_results = [SearchResult(task_run_id=task_run.id, keyword=keyword, matched_file_path=p) for p in matched_paths]
+        search_results = [SearchResult(task_run_id=task_run.id, keyword=keyword, matched_file_path=p) for p in
+                          matched_paths]
         self.db_handler.bulk_insert_search_results(search_results)
-            
+
         destination_dir = os.path.join(target_path, f"内容包含_{keyword}")
         os.makedirs(destination_dir, exist_ok=True)
         skipped_files = []
@@ -349,10 +424,10 @@ class Orchestrator:
             except PermissionError:
                 logging.warning(f"权限错误：无法将搜索到的文件 {file_path} 复制到目标目录，可能文件已被锁定。将跳过复制。")
                 skipped_files.append(file_path)
-            
+
         summary = f"文件内容搜索完成！共找到并复制了 {len(matched_paths)} 个文件。"
         if skipped_files:
-            summary += f" \n\n警告：有 {len(skipped_files)} 个文件因权限问题被跳过（可能已被其他程序锁定）。"
+            summary += f" \\n\\n警告：有 {len(skipped_files)} 个文件因权限问题被跳过（可能已被其他程序锁定）。"
         summary += " 仅显示前100条，完整结果已存入数据库。" if len(matched_files) > 100 else " 详情已存入数据库。"
         self.db_handler.update_task_summary(task_run.id, summary)
         return summary, search_results[:100]

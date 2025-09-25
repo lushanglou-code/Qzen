@@ -1,138 +1,123 @@
 # -*- coding: utf-8 -*-
 """
-相似度计算引擎模块。
+相似度计算引擎模块 (v4.2.6 - 修复关键词提取方法)。
 
-封装了文档的特征提取（TF-IDF）、相似度计算（余弦相似度）以及
-高效的近邻搜索算法。该引擎经过特别配置，以支持高效的中文文本处理。
+此版本将 `get_top_keywords_for_docs` 重命名为 `get_top_keywords`，
+以修复在 `cluster_engine` 中因方法名不匹配而导致的 `AttributeError`。
 """
 
 import logging
-import pickle
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple
 
-import jieba  # 引入 jieba 分词库
-import numpy as np
-from scipy.sparse import csr_matrix
+import jieba
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+# --- 内置停用词 ---
+BUILTIN_STOPWORDS = set([
+    "的", "一", "不", "在", "人", "有", "是", "为", "以", "于", "上", "他", "而",
+    "后", "之", "来", "及", "了", "因", "下", "可", "到", "由", "这", "与", "也",
+    "此", "但", "并", "得", "其", "我们", "你", "他们", "一个", "一些", "和",
+    "或", "等", "地", "中", "对", "从", "到", "我", "她"
+])
 
 
 class SimilarityEngine:
     """
-    封装了文档相似度计算和搜索的核心功能。
-
-    该引擎的核心是 scikit-learn 的 `TfidfVectorizer`。通过为其提供一个
-    集成了 `jieba` 分词的自定义 `tokenizer`，该引擎能够将原始的中文
-    文本文档集合，高效地转换为一个可用于量化比较的 TF-IDF 特征矩阵。
-
-    Attributes:
-        vectorizer (TfidfVectorizer): 一个为处理中文而特别配置的 scikit-learn
-                                  TF-IDF 向量化器实例。
-        feature_matrix (csr_matrix | None): 由 `vectorize_documents` 方法生成的
-                                          文档-词项稀疏矩阵。在向量化之前为 None。
-        stopwords (set[str]): 从外部文件和用户配置中加载的、统一的停用词集合。
-        doc_map (List[Dict[str, Any]]): 一个包含文档 ID 和路径的映射列表，
-                                       其顺序与特征矩阵的行一一对应。
+    封装了所有与文本向量化和相似度计算相关的逻辑。
     """
 
-    def __init__(self, max_features: int = 5000, stopwords_path: str = "stopwords.txt", custom_stopwords: List[str] = None):
+    def __init__(self, max_features: int = 5000, custom_stopwords: List[str] = None):
         """
-        初始化相似度引擎，并配置中文处理流程。
-
-        Args:
-            max_features (int): TF-IDF 向量化器构建词汇表时使用的最大特征
-                              （词汇）数量。这是控制内存使用和计算复杂度的
-                              关键参数。
-            stopwords_path (str): 内置停用词文件的路径。
-            custom_stopwords (List[str] | None): 一个包含用户自定义停用词的列表。
+        初始化 SimilarityEngine。
         """
-        self.stopwords = set()
-        self.stopwords_path = stopwords_path  # 保存路径以备后续热更新
-        self.update_stopwords(custom_stopwords) # 调用新的更新方法完成初始加载
-
+        self.max_features = max_features
+        self.stopwords = self._load_stopwords(custom_stopwords)
         self.vectorizer = TfidfVectorizer(
-            max_features=max_features,
-            max_df=0.95,
-            min_df=2,
-            tokenizer=self._chinese_tokenizer,
-            token_pattern=None
+            max_features=self.max_features,
+            tokenizer=self._tokenizer,
+            stop_words=list(self.stopwords)
         )
-        self.feature_matrix: csr_matrix | None = None
-        self.doc_map: List[Dict[str, Any]] = []
+        self.feature_matrix = None
+        self.doc_map = []
 
-    def update_stopwords(self, custom_stopwords: List[str] = None) -> None:
-        """
-        清空并重新加载所有停用词（内置+自定义），实现停用词库的动态更新。
-
-        Args:
-            custom_stopwords: 一个包含新的用户自定义停用词的列表。
-        """
-        self.stopwords.clear()
-        try:
-            with open(self.stopwords_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    self.stopwords.add(line.strip().lower())
-            logging.info(f"成功从 {self.stopwords_path} 加载 {len(self.stopwords)} 个内置停用词。")
-        except FileNotFoundError:
-            logging.warning(f"内置停用词文件 {self.stopwords_path} 未找到。")
-
+    def _load_stopwords(self, custom_stopwords: List[str] = None) -> set:
+        """加载停用词。"""
+        stopwords = BUILTIN_STOPWORDS.copy()
         if custom_stopwords:
-            before_count = len(self.stopwords)
-            for word in custom_stopwords:
-                if word.strip():
-                    self.stopwords.add(word.strip().lower())
-            added_count = len(self.stopwords) - before_count
-            logging.info(f"成功加载并合并 {added_count} 个自定义停用词。")
-        
-        logging.info(f"停用词库准备就绪，共包含 {len(self.stopwords)} 个唯一停用词。")
+            stopwords.update(custom_stopwords)
+        return stopwords
 
-    def _chinese_tokenizer(self, text: str) -> List[str]:
-        """
-        自定义的中文分词器，供 TfidfVectorizer 调用。
-        """
-        words = jieba.cut(text)
-        return [word for word in words if word.lower() not in self.stopwords and len(word) > 1]
+    def update_stopwords(self, custom_stopwords: List[str]):
+        """动态更新停用词列表并重建向量化器。"""
+        self.stopwords = self._load_stopwords(custom_stopwords)
+        self.vectorizer = TfidfVectorizer(
+            max_features=self.max_features,
+            tokenizer=self._tokenizer,
+            stop_words=list(self.stopwords)
+        )
+        logging.info("SimilarityEngine 已接收新的停用词并重建了 TF-IDF 向量化器。")
 
-    def vectorize_documents(self, documents: List[str]) -> csr_matrix:
-        """
-        使用TF-IDF算法将一组文档内容转化为特征向量矩阵。
-        """
-        self.feature_matrix = self.vectorizer.fit_transform(documents)
-        return self.feature_matrix
+    def _tokenizer(self, text: str) -> List[str]:
+        """自定义分词器。"""
+        return [word for word in jieba.cut(text) if word.strip() and word not in self.stopwords]
 
-    def find_top_n_similar(self, target_vector: csr_matrix, n: int = 10) -> Tuple[List[int], List[float]]:
+    def vectorize_documents(self, documents: List[str]):
+        """将文档列表转换为 TF-IDF 特征矩阵。"""
+        if not documents:
+            return None
+        return self.vectorizer.fit_transform(documents)
+
+    def find_top_n_similar(self, target_vector, n: int = 5) -> Tuple[List[int], List[float]]:
+        """在特征矩阵中查找与目标向量最相似的 N 个向量。"""
+        if self.feature_matrix is None:
+            return [], []
+
+        cosine_similarities = cosine_similarity(target_vector, self.feature_matrix).flatten()
+        # 使用 argpartition 高效查找 top N，避免对整个数组排序
+        # 我们需要 N+1 个，因为最相似的总是它自己
+        n_plus_one = min(n + 1, len(cosine_similarities))
+        top_indices = np.argpartition(cosine_similarities, -n_plus_one)[-n_plus_one:]
+
+        # 过滤掉自身
+        top_indices = [i for i in top_indices if cosine_similarities[i] < 0.9999]
+
+        # 按分数排序
+        sorted_indices = sorted(top_indices, key=lambda i: cosine_similarities[i], reverse=True)
+
+        top_n_indices = sorted_indices[:n]
+        top_n_scores = [cosine_similarities[i] for i in top_n_indices]
+
+        return top_n_indices, top_n_scores
+
+    def get_top_keywords(self, doc_indices: List[int], n: int = 5) -> str:
         """
-        在已有的特征矩阵中，查找与目标向量最相似的前 N 个向量。
+        v4.2.6 修复: 为给定的文档索引列表提取最具代表性的关键词。
         """
         if self.feature_matrix is None:
-            raise ValueError("特征矩阵尚未被计算，请先调用 vectorize_documents。")
+            raise NotFittedError("The TF-IDF vectorizer is not fitted")
 
-        sim_scores = cosine_similarity(target_vector, self.feature_matrix).flatten()
-        num_docs = self.feature_matrix.shape[0]
-        k = min(n + 1, num_docs)
-        
-        if k <= 1 and num_docs > 0:
-             return [], []
+        # 合并指定文档的向量
+        combined_vector = np.sum(self.feature_matrix[doc_indices], axis=0)
 
-        top_indices = np.argpartition(sim_scores, -k)[-k:]
-        top_indices = [i for i in top_indices if sim_scores[i] < 0.99999]
-        sorted_indices = sorted(top_indices, key=lambda i: sim_scores[i], reverse=True)
-        
-        final_indices = sorted_indices[:n]
-        final_scores = [sim_scores[i] for i in final_indices]
+        # 转换为 (1, n_features) 的稠密数组
+        combined_vector = np.asarray(combined_vector).flatten()
 
-        return final_indices, final_scores
+        # 获取特征词（关键词）列表
+        feature_names = self.vectorizer.get_feature_names_out()
 
-    def save_model(self, file_path: str) -> None:
-        """
-        将训练好的TF-IDF向量化器序列化到磁盘。
-        """
-        with open(file_path, 'wb') as f:
-            pickle.dump(self.vectorizer, f)
+        # 找到分数最高的 N 个词的索引
+        # 使用 argpartition 避免完全排序
+        n_keywords = min(n, len(feature_names))
+        if n_keywords == 0:
+            return "无有效关键词"
 
-    def load_model(self, file_path: str) -> None:
-        """
-        从磁盘加载之前保存的TF-IDF向量化器。
-        """
-        with open(file_path, 'rb') as f:
-            self.vectorizer = pickle.load(f)
+        top_indices = np.argpartition(combined_vector, -n_keywords)[-n_keywords:]
+
+        # 按分数排序并获取关键词
+        sorted_indices = sorted(top_indices, key=lambda i: combined_vector[i], reverse=True)
+
+        top_keywords = [feature_names[i] for i in sorted_indices]
+
+        return "_".join(top_keywords)

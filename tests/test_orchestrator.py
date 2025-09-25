@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-单元测试模块：测试业务流程协调器 Orchestrator (v3.2 修正版)。
+单元测试模块：测试业务流程协调器 Orchestrator (v4.3 验证版)。
 
-此版本更新了对 prime_similarity_engine 的测试，以匹配 v3.2 中
-Orchestrator 和 SimilarityEngine 之间的新交互模式。
+此版本新增了一个关键测试用例 (`test_deduplication_flattens_and_renames_on_conflict`)
+来取代旧的测试，以精确验证 v4.3 版本中实现的“扁平化、去重与重命名”的
+数据摄取新策略，确保其严格符合架构设计。
 """
 
 import os
@@ -25,9 +26,7 @@ class TestOrchestrator(unittest.TestCase):
 
     def setUp(self):
         self.mock_db_handler = MagicMock()
-        # 注意：这里会创建一个真实的 Orchestrator，但我们随后会替换掉它的内部引擎
         self.orchestrator = Orchestrator(db_handler=self.mock_db_handler, max_features=5000, slice_size_kb=1)
-        # 用模拟对象替换内部引擎，以便进行隔离测试
         self.orchestrator.similarity_engine = MagicMock()
         self.orchestrator.cluster_engine = MagicMock()
 
@@ -35,71 +34,86 @@ class TestOrchestrator(unittest.TestCase):
         self.assertIsNotNone(self.orchestrator)
         self.assertEqual(self.orchestrator.db_handler, self.mock_db_handler)
 
-    @patch('qzen_core.orchestrator.Orchestrator.prime_similarity_engine')
-    def test_run_iterative_clustering_delegates_to_cluster_engine(self, mock_prime_engine):
-        """
-        测试 run_iterative_clustering 是否正确地将调用委托给 ClusterEngine。
-        """
-        # --- Arrange ---
-        target_dir = "/intermediate/folder_to_cluster"
-        k = 5
-        similarity_threshold = 0.85
-        mock_progress_callback = MagicMock()
-        mock_is_cancelled_callback = MagicMock(return_value=False)
-
-        # 模拟引擎依赖项已准备就绪
-        self.orchestrator.similarity_engine.feature_matrix = csr_matrix(np.eye(10))
-        self.mock_db_handler.create_task_run.return_value = TaskRun(id=99)
-
-        # --- Act ---
-        summary = self.orchestrator.run_iterative_clustering(
-            target_dir=target_dir,
-            k=k,
-            similarity_threshold=similarity_threshold,
-            progress_callback=mock_progress_callback,
-            is_cancelled_callback=mock_is_cancelled_callback
-        )
-
-        # --- Assert ---
-        # 1. 验证 prime_similarity_engine 被调用以确保引擎已预热
-        mock_prime_engine.assert_called_once_with(is_cancelled_callback=mock_is_cancelled_callback)
-
-        # 2. 验证数据库任务已创建
-        self.mock_db_handler.create_task_run.assert_called_once_with(task_type='iterative_clustering')
-
-        # 3. 验证核心委托：Orchestrator 调用了 ClusterEngine 的 run_clustering 方法
-        self.orchestrator.cluster_engine.run_clustering.assert_called_once_with(
-            target_dir=target_dir,
-            k=k,
-            similarity_threshold=similarity_threshold,
-            progress_callback=mock_progress_callback,
-            is_cancelled_callback=mock_is_cancelled_callback
-        )
-
-        # 4. 验证任务摘要已更新
-        self.mock_db_handler.update_task_summary.assert_called_once_with(99, ANY)
-        self.assertIn("成功完成", summary)
-
     @patch('qzen_core.orchestrator.file_handler')
     @patch('qzen_core.orchestrator.shutil')
     @patch('qzen_core.orchestrator.os')
-    def test_run_deduplication_core_happy_path(self, mock_os, mock_shutil, mock_file_handler):
-        source_path, intermediate_path, allowed_extensions = "/source", "/intermediate", {'.txt'}
-        mock_os.path.join.side_effect, mock_os.path.normpath.side_effect, mock_os.path.relpath.side_effect, mock_os.path.splitext.side_effect = os.path.join, os.path.normpath, os.path.relpath, os.path.splitext
-        mock_os.path.dirname.return_value, mock_os.path.basename.side_effect = "/intermediate", os.path.basename
-        mock_files = [f"{source_path}/unique.txt", f"{source_path}/duplicate.txt", f"{source_path}/another_duplicate.txt"]
-        mock_file_handler.scan_files.return_value = mock_files
-        def mock_calculate_hash(file_path): return "hash_unique" if "unique" in file_path else ("hash_duplicate" if "duplicate" in file_path else None)
-        mock_file_handler.calculate_file_hash.side_effect = mock_calculate_hash
+    def test_deduplication_flattens_and_renames_on_conflict(self, mock_os, mock_shutil, mock_file_handler):
+        """
+        v4.3 验证: 测试 run_deduplication_core 是否正确地实现了“扁平化、去重与重命名”策略。
+        """
+        # --- Arrange ---
+        source_path = "/source"
+        intermediate_path = "/intermediate"
+        allowed_extensions = {'.txt'}
+
+        # 1. 模拟文件系统扫描结果：两个内容不同但同名的文件，位于不同子目录
+        file1_original_path = os.path.join(source_path, "A", "report.txt")
+        file2_original_path = os.path.join(source_path, "B", "report.txt")
+        file3_duplicate_content_path = os.path.join(source_path, "C", "report.txt") # 内容与 file1 相同
+
+        mock_file_handler.scan_files.return_value = [file1_original_path, file2_original_path, file3_duplicate_content_path]
+
+        # 2. 模拟内容切片和哈希计算
+        def get_slice_side_effect(path):
+            if path == file1_original_path: return "content1"
+            if path == file2_original_path: return "content2"
+            if path == file3_duplicate_content_path: return "content1" # 与 file1 内容相同
+            return ""
+        def get_hash_side_effect(content):
+            if content == "content1": return "hash1"
+            if content == "content2": return "hash2"
+            return ""
+        mock_file_handler.get_content_slice.side_effect = get_slice_side_effect
+        mock_file_handler.calculate_content_hash.side_effect = get_hash_side_effect
+
+        # 3. 模拟 os 行为以触发重命名
+        # 路径拼接和拆分使用真实函数
+        mock_os.path.join.side_effect = os.path.join
+        mock_os.path.basename.side_effect = os.path.basename
+        mock_os.path.splitext.side_effect = os.path.splitext
+        mock_os.path.split.side_effect = os.path.split
+
+        # 关键：模拟 os.path.exists 来触发重命名逻辑
+        # 第一次检查 report.txt -> 不存在 (False)
+        # 第二次检查 report.txt -> 存在 (True)
+        # 第三次检查 report_dup1.txt -> 不存在 (False)
+        mock_os.path.exists.side_effect = [False, True, False]
+
+        # 4. 模拟数据库任务创建
         self.mock_db_handler.create_task_run.return_value = TaskRun(id=1)
-        mock_progress_callback, mock_is_cancelled_callback = MagicMock(), MagicMock(return_value=False)
-        summary, results = self.orchestrator.run_deduplication_core(source_path, intermediate_path, allowed_extensions, mock_progress_callback, mock_is_cancelled_callback)
+
+        # --- Act ---
+        summary, results = self.orchestrator.run_deduplication_core(
+            source_path, intermediate_path, allowed_extensions, MagicMock(), lambda: False
+        )
+
+        # --- Assert ---
+        # 1. 断言内容去重：只处理了两个唯一内容的文件
+        self.assertEqual(len(results), 1) # 一个文件被识别为内容重复
+        self.assertEqual(results[0].duplicate_file_path, file3_duplicate_content_path)
+
+        # 2. 断言扁平化与重命名：shutil.copy2 被调用了两次，且第二次的目标路径被重命名
         self.assertEqual(mock_shutil.copy2.call_count, 2)
-        mock_shutil.copy2.assert_has_calls([call(f"{source_path}/unique.txt", os.path.normpath(os.path.join(intermediate_path, "unique.txt"))), call(f"{source_path}/duplicate.txt", os.path.normpath(os.path.join(intermediate_path, "duplicate.txt")))], any_order=True)
-        self.assertEqual(self.mock_db_handler.bulk_insert_documents.call_count, 1)
-        self.assertEqual(self.mock_db_handler.bulk_insert_deduplication_results.call_count, 1)
-        self.mock_db_handler.update_task_summary.assert_called_once()
-        self.assertEqual(mock_progress_callback.call_count, len(mock_files))
+        expected_copy_calls = [
+            # 第一次复制，使用原始文件名
+            call(file1_original_path, os.path.join(intermediate_path, "report.txt")),
+            # 第二次复制，因为文件名冲突，重命名为 _dup1
+            call(file2_original_path, os.path.join(intermediate_path, "report_dup1.txt"))
+        ]
+        mock_shutil.copy2.assert_has_calls(expected_copy_calls, any_order=False) # 顺序很重要
+
+        # 3. 断言数据库记录的正确性：存入数据库的路径是经过重命名后的权威路径
+        self.mock_db_handler.bulk_insert_documents.assert_called_once()
+        docs_to_save = self.mock_db_handler.bulk_insert_documents.call_args[0][0]
+        self.assertEqual(len(docs_to_save), 2)
+
+        # 提取保存到数据库的路径，并验证
+        saved_paths = {doc.file_path for doc in docs_to_save}
+        expected_paths_in_db = {
+            os.path.join(intermediate_path, "report.txt").replace('\\', '/'),
+            os.path.join(intermediate_path, "report_dup1.txt").replace('\\', '/')
+        }
+        self.assertSetEqual(saved_paths, expected_paths_in_db)
 
     @patch('qzen_core.orchestrator.file_handler')
     @patch('qzen_core.orchestrator.shutil')
@@ -131,7 +145,6 @@ class TestOrchestrator(unittest.TestCase):
         self.assertIn("无需操作", result_summary)
 
     def test_prime_similarity_engine_happy_path(self):
-        # v3.2 修正: 模拟 Document 对象时添加 id
         vec1, vec2 = csr_matrix(np.array([[1, 0, 1]])), csr_matrix(np.array([[0, 1, 1]]))
         doc1 = Document(id=1, file_path="/path/doc1.txt", feature_vector=_vector_to_json(vec1))
         doc2 = Document(id=2, file_path="/path/doc2.txt", feature_vector=_vector_to_json(vec2))
@@ -142,7 +155,6 @@ class TestOrchestrator(unittest.TestCase):
         
         self.mock_db_handler.get_all_documents.assert_called_once()
         
-        # v3.2 修正: 不再检查 Orchestrator 的私有属性，而是检查其对 SimilarityEngine 的公共属性的设置
         expected_matrix = vstack([vec1, vec2])
         expected_doc_map = [
             {'id': 1, 'file_path': '/path/doc1.txt'},
@@ -158,7 +170,6 @@ class TestOrchestrator(unittest.TestCase):
         
         self.orchestrator.prime_similarity_engine()
         
-        # v3.2 修正: 检查 SimilarityEngine 的公共属性
         self.assertIsNone(self.orchestrator.similarity_engine.feature_matrix)
         self.assertEqual(self.orchestrator.similarity_engine.doc_map, [])
         self.assertTrue(self.orchestrator._is_engine_primed)

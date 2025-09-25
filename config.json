@@ -1,9 +1,9 @@
 {
-    "source_dir": "E:\\workfortest\\testfile",
+    "source_dir": "E:\\workfortest\\testfile\\解决方案\\oracle迁移",
     "intermediate_dir": "E:\\workfortest\\oldfile",
     "target_dir": "E:\\workfortest\\newfile",
     "max_features": 7000,
     "custom_stopwords": "达梦\nDM\n数据库\n管理\n系统\n数据\n应用\n数字",
     "last_keyword": "两地三中心",
-    "similarity_threshold": 0.5999999999999999
+    "similarity_threshold": 0.8
 }

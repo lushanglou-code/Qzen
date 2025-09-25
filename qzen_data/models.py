@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-数据库模型定义模块 (v3.3.2 - 驱动兼容性修正)。
+数据库模型定义模块 (v4.2.8 - 为外键添加显式名称)。
 
-此版本将所有时间戳列的类型从 DateTime 更改为 String，并使用 ISO 8601
-格式的字符串 (`isoformat()`) 来存储时间。这旨在完全绕过 `sqlalchemy-dm`
-驱动中有缺陷的日期时间处理逻辑，从根本上解决 `DatabaseError`。
+此版本为所有的 ForeignKey 约束都增加了一个唯一的、显式的名称。
+这是为了解决在 DM8 数据库上，匿名约束无法通过 DDL 语句
+（无论是 SQLAlchemy 的抽象还是原生 SQL）被可靠地删除的问题。
+
+为约束命名是实现可靠的 `recreate_tables` 功能的先决条件。
 """
 
 from datetime import datetime, timezone
@@ -29,8 +31,7 @@ class Document(Base):
     file_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
     file_path: Mapped[str] = mapped_column(String(1024), nullable=False, index=True)
     content_slice: Mapped[str] = mapped_column(Text, nullable=True)
-    feature_vector: Mapped[str] = mapped_column(Text, nullable=True)  # 存储为 JSON 字符串
-    # v3.3.2 修正: 使用 String 类型存储 ISO 格式的时间戳字符串
+    feature_vector: Mapped[str] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(String, default=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: Mapped[str] = mapped_column(String, default=lambda: datetime.now(timezone.utc).isoformat(), onupdate=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -47,7 +48,6 @@ class TaskRun(Base):
     __tablename__ = "task_runs"
     id: Mapped[int] = mapped_column(primary_key=True)
     task_type: Mapped[str] = mapped_column(String(50), nullable=False)
-    # v3.3.2 修正: 使用 String 类型存储 ISO 格式的时间戳字符串
     start_time: Mapped[str] = mapped_column(String, default=lambda: datetime.now(timezone.utc).isoformat())
     summary: Mapped[str] = mapped_column(Text, nullable=True)
 
@@ -57,7 +57,8 @@ class DeduplicationResult(Base):
     """
     __tablename__ = "deduplication_results"
     id: Mapped[int] = mapped_column(primary_key=True)
-    task_run_id: Mapped[int] = mapped_column(ForeignKey("task_runs.id"))
+    # v4.2.8 修复: 为外键添加显式名称
+    task_run_id: Mapped[int] = mapped_column(ForeignKey("task_runs.id", name="fk_dedup_task_run"))
     duplicate_file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     original_file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
 
@@ -67,7 +68,8 @@ class RenameResult(Base):
     """
     __tablename__ = "rename_results"
     id: Mapped[int] = mapped_column(primary_key=True)
-    task_run_id: Mapped[int] = mapped_column(ForeignKey("task_runs.id"))
+    # v4.2.8 修复: 为外键添加显式名称
+    task_run_id: Mapped[int] = mapped_column(ForeignKey("task_runs.id", name="fk_rename_task_run"))
     original_file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     new_file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
 
@@ -77,6 +79,7 @@ class SearchResult(Base):
     """
     __tablename__ = "search_results"
     id: Mapped[int] = mapped_column(primary_key=True)
-    task_run_id: Mapped[int] = mapped_column(ForeignKey("task_runs.id"))
+    # v4.2.8 修复: 为外键添加显式名称
+    task_run_id: Mapped[int] = mapped_column(ForeignKey("task_runs.id", name="fk_search_task_run"))
     keyword: Mapped[str] = mapped_column(String(255), nullable=False)
     matched_file_path: Mapped[str] = mapped_column(String(1024), nullable=False)

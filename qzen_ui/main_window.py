@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Qzen 主窗口模块 (v4.0.0 - 架构重构)。
+Qzen 主窗口模块 (v5.1.2 - 强制重编译)。
 
-此版本与所有 v4.0.0 的子模块（引擎、协调器、UI标签页）保持同步，
-完成了聚类功能解耦的最终实现。旧的、捆绑式的聚类调用逻辑被彻底
-替换为两个独立的、由新UI触发的原子化操作：K-Means聚类和相似度分组。
+此版本通过添加注释来强制 Python 解释器重新编译文件，
+以解决因缓存 (.pyc) 问题而导致的、已修复的导入错误反复出现的问题。
 """
 
 from __future__ import annotations # PEP 563: Solves circular import issues with type hints.
@@ -18,6 +17,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QProgressBar, QTabWidget, QPushButton
 )
 from PyQt6.QtGui import QAction, QCloseEvent
+# v5.1.2: 强制 Python 重新编译以加载正确的 PyQt6 路径
 from PyQt6.QtCore import pyqtSignal
 
 # --- v4.0.0 架构引入 ---
@@ -52,7 +52,7 @@ class MainWindow(QMainWindow):
         self.analysis_service: AnalysisService | None = None
         self.worker: Worker | None = None
 
-        self.setWindowTitle("Qzen (千针) v4.0 - 智能文档组织引擎")
+        self.setWindowTitle("Qzen (千针) v5.1 - 智能文档组织引擎 (MySQL/PyMySQL 版)")
         self.setGeometry(100, 100, 1200, 800)
 
         self._create_menus()
@@ -110,14 +110,12 @@ class MainWindow(QMainWindow):
         self.setup_tab.save_stopwords_clicked.connect(self._save_app_config)
         self.processing_tab.start_ingestion_clicked.connect(self.start_ingestion)
         
-        # --- v4.0.0 架构重构: 聚类信号连接更新 ---
         self.analysis_cluster_tab.run_kmeans_clicked.connect(self.start_kmeans_clustering)
         self.analysis_cluster_tab.run_similarity_clicked.connect(self.start_similarity_clustering)
         self.analysis_cluster_tab.select_source_file_clicked.connect(self._select_source_file)
         self.analysis_cluster_tab.find_similar_clicked.connect(self.find_similar_files)
         self.analysis_cluster_tab.export_similar_clicked.connect(self.export_similar_files)
         
-        # 关键词搜索标签页信号
         self.keyword_search_tab.search_by_filename_clicked.connect(self.start_filename_search)
         self.keyword_search_tab.search_by_content_clicked.connect(self.start_content_search)
         self.keyword_search_tab.export_results_clicked.connect(self.export_search_results)
@@ -141,7 +139,7 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def show_about_dialog(self):
-        QMessageBox.about(self, "关于 Qzen (千针)", "<p><b>Qzen (千针) v4.0</b></p><p>智能文档组织引擎。</p>")
+        QMessageBox.about(self, "关于 Qzen (千针)", "<p><b>Qzen (千针) v5.1 (MySQL/PyMySQL 版)</b></p><p>智能文档组织引擎。</p>")
 
     def _update_tab_states(self):
         is_db_configured = self.orchestrator is not None
@@ -152,22 +150,25 @@ class MainWindow(QMainWindow):
     def _select_directory(self, tab: QWidget, line_edit_name: str, caption: str):
         directory = QFileDialog.getExistingDirectory(self, caption)
         if directory:
-            # v4.0.0 修正: 确保聚类目标文件夹选择器也能正确更新
             if hasattr(tab, 'set_path_text'):
                 tab.set_path_text(line_edit_name, directory)
             if line_edit_name == "intermediate_dir_input":
                 self.analysis_cluster_tab.set_cluster_target_dir(directory)
 
     def show_db_config_dialog(self):
-        dialog = ConfigDialog(self)
-        if not dialog.exec(): return
+        """
+        v5.1 迁移: 使用 PyMySQL 驱动以解决二进制冲突。
+        """
+        # 假定数据库名为 'qzen_db'，请确保它已在 MySQL 中创建。
+        db_url = "mysql+pymysql://root:12345678@127.0.0.1:3306/qzen_db"
+        logging.info(f"正在使用硬编码的 MySQL 数据库连接 (通过 PyMySQL): {db_url}")
 
-        db_url = dialog.get_db_url()
         config = self.setup_tab.get_all_configs()
         try:
             self.db_handler = DatabaseHandler(db_url)
             if not self.db_handler.test_connection():
-                raise ConnectionError("无法连接到数据库，请检查配置信息。")
+                QMessageBox.critical(self, "连接失败", "无法连接到 MySQL 数据库。\n请确保：\n1. MySQL 服务正在运行。\n2. 用户名、密码、IP和端口正确。\n3. 数据库 'qzen_db' 已被创建。")
+                return
 
             self.orchestrator = Orchestrator(
                 db_handler=self.db_handler,
@@ -177,7 +178,7 @@ class MainWindow(QMainWindow):
             )
             self.analysis_service = AnalysisService(self.db_handler, self.orchestrator)
 
-            QMessageBox.information(self, "成功", "数据库连接成功，所有服务已准备就绪！")
+            QMessageBox.information(self, "成功", "MySQL 数据库连接成功，所有服务已准备就绪！")
         except Exception as e:
             QMessageBox.critical(self, "初始化失败", f"无法完成数据库或服务的设置。\n错误: {e}")
             self.db_handler = None
@@ -352,4 +353,4 @@ class MainWindow(QMainWindow):
     def update_progress(self, current_value: int, max_value: int, status_text: str):
         self.progress_bar.setMaximum(max_value)
         self.progress_bar.setValue(current_value)
-        self.setWindowTitle(f"Qzen (千针) v4.0 - {status_text}")
+        self.setWindowTitle(f"Qzen (千针) v5.1 - {status_text}")

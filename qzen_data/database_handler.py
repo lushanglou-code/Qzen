@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-数据库操作模块 (v3.4.1 - 优化批量插入的返回逻辑)。
+数据库操作模块 (v5.0 - MySQL 迁移)。
 
-此版本在 v3.4.0 的基础上，修改了 `bulk_insert_documents` 方法，
-使其在完成插入后，返回一个包含所有被成功插入数据库的 `Document` 对象的列表。
+此版本根据 v5.0 的架构文档，将数据库后端从 DM8 迁移到 MySQL 8.0。
 
-这一修改至关重要，它使得业务逻辑层能够明确知道哪些文件是“新”的，
-从而可以对这些新文件执行后续操作，例如文件名冲突检查和重命名，
-为实现完整的去重策略铺平了道路。
+核心修复：
+1.  **废弃所有手动 DDL**: 移除了所有为 DM8 编写的、复杂的、三阶段原子化的
+    `recreate_tables` 逻辑。
+2.  **恢复标准实践**: 改为使用 SQLAlchemy 官方推荐的、跨数据库兼容的
+    `Base.metadata.drop_all()` 和 `Base.metadata.create_all()` 方法。
+
+这使得数据库操作更简洁、更健壮，并完全拥抱新选择的 MySQL 技术栈。
 """
 
 from datetime import datetime, timezone
@@ -16,7 +19,7 @@ import logging
 import os
 from typing import Generator, List, Optional
 
-from sqlalchemy import create_engine, NullPool, StaticPool
+from sqlalchemy import create_engine, NullPool, StaticPool, text
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.engine import Engine
 
@@ -43,6 +46,7 @@ class DatabaseHandler:
         """
         if self._engine is None:
             engine_opts = {}
+            # v5.0 迁移: 移除所有 DM8 特定的连接参数
             connect_args = {}
 
             if self._db_url.startswith("sqlite:///"):
@@ -50,10 +54,7 @@ class DatabaseHandler:
                 connect_args['check_same_thread'] = False
             else:
                 engine_opts['poolclass'] = NullPool
-                connect_args['connection_timeout'] = 15
-                if self._db_url.startswith('dm'):
-                    connect_args['local_code'] = 1 # 1 = UTF-8
-                    logging.info("检测到达梦数据库，已强制设置连接编码为 UTF-8。")
+                connect_args['connect_timeout'] = 15
 
             self._engine = create_engine(
                 self._db_url,
@@ -90,29 +91,18 @@ class DatabaseHandler:
 
     def recreate_tables(self) -> None:
         """
-        逐一清空并重新创建所有在 Base.metadata 中定义的、由本程序管理的表。
+        v5.0 迁移: 使用 SQLAlchemy 标准实践，重建数据库。
         """
         engine = self._get_engine()
-        logging.info("正在初始化数据库：将逐一清空并重新创建所有相关数据表...")
-        tables_to_drop = reversed(Base.metadata.sorted_tables)
-        
-        logging.info("开始逐一删除旧表...")
-        for table in tables_to_drop:
-            try:
-                table.drop(engine, checkfirst=True)
-                logging.info(f"  - 已删除表: {table.name}")
-            except Exception as e:
-                logging.warning(f"删除表 {table.name} 时出现问题 (可能表原本不存在): {e}")
-
-        logging.info("表删除完成。现在开始逐一创建新表...")
-        for table in Base.metadata.sorted_tables:
-            try:
-                table.create(engine, checkfirst=True)
-                logging.info(f"  + 已创建表: {table.name}")
-            except Exception as e:
-                logging.error(f"创建表 {table.name} 时发生严重错误: {e}", exc_info=True)
-                raise
-        logging.info("数据库初始化完成，所有表已成功创建。")
+        logging.info("正在使用 SQLAlchemy 标准方法初始化数据库...")
+        try:
+            # 使用 SQLAlchemy 的标准方法，它能正确处理跨数据库的依赖关系
+            Base.metadata.drop_all(engine)
+            Base.metadata.create_all(engine)
+            logging.info("数据库初始化完成，所有表已成功重建。")
+        except Exception as e:
+            logging.error(f"数据库初始化时发生严重错误: {e}", exc_info=True)
+            raise
 
     def test_connection(self) -> bool:
         """
@@ -133,11 +123,18 @@ class DatabaseHandler:
 
     def get_document_by_path(self, file_path: str) -> Optional[Document]:
         """
-        v3.2 新增: 获取指定绝对路径的单个 Document 记录。
+        获取指定绝对路径的单个 Document 记录。
         """
         normalized_path = os.path.normpath(file_path)
         with self.get_session() as session:
             return session.query(Document).filter(Document.file_path == normalized_path).first()
+
+    def get_document_by_hash(self, file_hash: str) -> Optional[Document]:
+        """
+        获取指定内容哈希的单个 Document 记录。
+        """
+        with self.get_session() as session:
+            return session.query(Document).filter(Document.file_hash == file_hash).first()
 
     def get_documents_by_ids(self, doc_ids: List[int]) -> List[Document]:
         """获取指定 id 列表的多个 Document 记录。"""
@@ -166,77 +163,70 @@ class DatabaseHandler:
             return session.query(Document).filter(Document.file_path.like(f"%{keyword}%")).all()
 
     def search_documents_by_content(self, keyword: str) -> List[Document]:
-        """根据内容切片中的关键词搜索文档。"""
+        """
+        根据内容切片中的关键词搜索文档。"""
         with self.get_session() as session:
             return session.query(Document).filter(Document.content_slice.like(f"%{keyword}%")).all()
 
     def bulk_insert_documents(self, documents: List[Document]) -> List[Document]:
         """
-        v3.4.1 优化: 基于内容去重的高效批量插入，并返回新插入的记录。
-        在插入前检查文件哈希，避免 'IntegrityError'。
-
-        Returns:
-            List[Document]: 成功插入到数据库的新文档对象列表。
+        基于内容去重的高效批量插入，并返回新插入的记录。
         """
         if not documents:
             return []
 
-        # 1. 从待插入列表中提取所有哈希值
         incoming_hashes = {doc.file_hash for doc in documents}
 
-        # 2. 查询数据库，找出这些哈希值中已经存在的
         with self.get_session() as session:
             existing_hashes_query = session.query(Document.file_hash).filter(Document.file_hash.in_(incoming_hashes))
             existing_hashes = {row[0] for row in existing_hashes_query}
-            logging.info(f"数据库查询完成，在 {len(incoming_hashes)} 个待插入项中发现 {len(existing_hashes)} 个已存在的哈希。")
+            logging.info(
+                f"数据库查询完成，在 {len(incoming_hashes)} 个待插入项中发现 {len(existing_hashes)} 个已存在的哈希。")
 
-        # 3. 过滤掉已存在的文件，只准备插入新文件
         documents_to_insert = [doc for doc in documents if doc.file_hash not in existing_hashes]
-        
+
         num_duplicates = len(documents) - len(documents_to_insert)
         if num_duplicates > 0:
             logging.info(f"检测到 {num_duplicates} 个内容重复的文档，将跳过插入。")
 
-        # 4. 批量插入新文件
         if not documents_to_insert:
             logging.info("没有新的文档需要插入。")
             return []
-            
+
         with self.get_session() as session:
             session.add_all(documents_to_insert)
             session.commit()
             logging.info(f"成功批量插入 {len(documents_to_insert)} 条新文档记录。")
-        
+
         return documents_to_insert
 
     def bulk_update_documents(self, documents: List[Document]) -> None:
         """
-        v3.3.7 最终修复: 严格遵守“逐条更新并提交”的约束，并确保所有相关属性都被更新。
+        v5.0 迁移: 维持逐条更新模式以保证代码一致性。
         """
         if not documents:
             return
 
-        logging.info(f"开始逐一更新 {len(documents)} 条文档记录 (v3.3.7 修复逻辑)... ")
+        logging.info(f"开始逐一更新 {len(documents)} 条文档记录...")
         updated_count = 0
         for doc_data in documents:
             try:
                 with self.get_session() as session:
                     doc_to_update = session.get(Document, doc_data.id)
                     if doc_to_update:
-                        # 关键修复：同时检查并更新 file_path 和 feature_vector
                         if doc_data.file_path:
                             doc_to_update.file_path = doc_data.file_path
                         if doc_data.feature_vector:
                             doc_to_update.feature_vector = doc_data.feature_vector
-                        
+
                         doc_to_update.updated_at = datetime.now(timezone.utc).isoformat()
                         session.commit()
                         updated_count += 1
                     else:
                         logging.warning(f"尝试更新一个不存在的文档 (ID: {doc_data.id})，已跳过。")
             except Exception as e:
-                logging.error(f"更新文档 (ID: {doc_data.id}) 时发生严重错误，该记录可能未被持久化: {e}", exc_info=True)
-        
+                logging.error(f"更新文档 (ID: {doc_data.id}) 时发生严重错误: {e}", exc_info=True)
+
         logging.info(f"尝试更新 {len(documents)} 条记录，成功更新并提交了 {updated_count} 条。")
 
     def create_task_run(self, task_type: str) -> TaskRun:
@@ -261,7 +251,6 @@ class DatabaseHandler:
                 session.commit()
 
     def bulk_insert_deduplication_results(self, results: List[DeduplicationResult]) -> None:
-        """v3.3 优化: 使用 add_all 执行高效的批量插入。"""
         if not results:
             return
         with self.get_session() as session:
@@ -270,9 +259,6 @@ class DatabaseHandler:
             logging.info(f"成功批量插入 {len(results)} 条去重结果。")
 
     def bulk_insert_rename_results(self, results: List[RenameResult]) -> None:
-        """
-        v3.3 优化: 使用 add_all 执行高效的批量插入。
-        """
         if not results:
             return
         with self.get_session() as session:
@@ -281,8 +267,6 @@ class DatabaseHandler:
             logging.info(f"成功批量插入 {len(results)} 条重命名结果。")
 
     def bulk_insert_search_results(self, results: List[SearchResult]) -> None:
-        """
-        v3.3 优化: 使用 add_all 执行高效的批量插入。"""
         if not results:
             return
         with self.get_session() as session:

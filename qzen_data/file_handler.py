@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-文件系统操作模块 (v4.0.3 - 路径标准化修正)。
+文件系统操作模块 (v4.2.5 - 诊断增强)。
 
-封装了所有与文件、目录相关的底层操作，如扫描文件、读取文件内容、
-计算哈希值等。此模块中的所有函数都应设计为无状态的纯函数，不依
-赖于任何外部状态或类实例。
+此版本在 scan_files 中增加了 DEBUG 级别的日志，用于在诊断模式下
+精确追踪每个被扫描到的文件的原始路径和标准化后的路径，以排查
+系统性的路径不一致问题。
 """
 
 import hashlib
@@ -26,7 +26,8 @@ def _clean_text(text: str) -> str:
     对文本进行清洗，为分词和向量化做准备。
     """
     text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', ' ', text)
+    # v4.2.1 最终修复: 使用三重引号 r"""...""" 彻底解决引号冲突导致的 SyntaxError
+    text = re.sub(r"""[^\u4e00-\u9fa5a-zA-Z0-9,.!?;:()"\'[\]]""", ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -34,15 +35,6 @@ def _clean_text(text: str) -> str:
 def scan_files(root_path: str, allowed_extensions: set[str]) -> Iterator[str]:
     """
     递归扫描指定目录下所有符合扩展名要求的文件。
-    v4.0.3 修正: 强制所有返回的路径都使用正斜杠 (/) 作为分隔符，以确保
-    跨平台和数据库查询的一致性。
-
-    Args:
-        root_path: 需要扫描的根目录路径。
-        allowed_extensions: 一个包含允许的文件扩展名的集合。
-
-    Yields:
-        一个迭代器，每次返回一个使用正斜杠的、符合条件的文件的完整路径字符串。
     """
     if not os.path.isdir(root_path):
         logging.warning(f"指定的扫描路径不是一个有效目录: {root_path}")
@@ -56,15 +48,17 @@ def scan_files(root_path: str, allowed_extensions: set[str]) -> Iterator[str]:
             file_ext = os.path.splitext(filename)[1].lower()
             if file_ext in allowed_extensions:
                 full_path = os.path.join(dirpath, filename)
-                # v4.0.3 修正: 强制使用正斜杠，确保路径标准化
-                yield full_path.replace('\\', '/')
+                # v4.2.5 诊断: 记录yield的每个路径
+                normalized_path = full_path.replace('\\', '/')
+                logging.debug(f"[DIAGNOSTIC|file_handler.scan_files] Yielding normalized path: {normalized_path}")
+                yield normalized_path
 
 
 def calculate_file_hash(file_path: str) -> str | None:
     """
     计算单个文件的 SHA-256 哈希值。
+    v3.5后，此函数主要用于验证文件完整性，而非去重。
     """
-    # 在进行文件操作前，先将传入的（可能统一为 / 的）路径转换为系统原生格式
     norm_path = os.path.normpath(file_path)
     sha256_hash = hashlib.sha256()
     try:
@@ -77,11 +71,23 @@ def calculate_file_hash(file_path: str) -> str | None:
         return None
 
 
-def get_content_slice(file_path: str, slice_size_kb: int = 1) -> str:
+def calculate_content_hash(content: str) -> str:
     """
-    提取、清洗并返回一个文档的内容切片（开头和结尾部分）。
+    v3.5 新增: 计算字符串内容的 SHA-256 哈希值。
+    此函数是基于内容摘要去重的核心。
     """
-    # 在进行文件操作前，先将传入的（可能统一为 / 的）路径转换为系统原生格式
+    sha256_hash = hashlib.sha256()
+    sha256_hash.update(content.encode('utf-8'))
+    return sha256_hash.hexdigest()
+
+
+def get_content_slice(file_path: str) -> str:
+    """
+    v3.5 重构: 提取、清洗并返回一个文档的三段式内容摘要。
+
+    摘要由头部、中部、尾部各 2KB 内容构成，总大小不超过 6KB。
+    这是所有相似度分析的基础。
+    """
     norm_path = os.path.normpath(file_path)
     file_ext = os.path.splitext(norm_path)[1].lower()
     text_content = ""
@@ -93,7 +99,7 @@ def get_content_slice(file_path: str, slice_size_kb: int = 1) -> str:
         elif file_ext == '.pdf':
             with fitz.open(norm_path) as doc:
                 for page in doc:
-                    text_content += page.get_text()
+                    text_content += page.get_text("text", sort=True)
         elif file_ext == '.docx':
             doc = docx.Document(norm_path)
             for para in doc.paragraphs:
@@ -122,18 +128,26 @@ def get_content_slice(file_path: str, slice_size_kb: int = 1) -> str:
                             text_content += str(cell_value) + ' '
                     text_content += '\n'
         elif file_ext == '.ppt':
-            logging.warning(f"'.ppt' (旧版PowerPoint) 文件是二进制格式，当前版本无法直接提取其文本内容。将跳过文件: {norm_path}")
+            logging.warning(
+                f"'.ppt' (旧版PowerPoint) 文件是二进制格式，当前版本无法直接提取其文本内容。将跳过文件: {norm_path}")
             return ""
     except Exception as e:
         logging.error(f"无法从文件提取文本内容: {norm_path}, 错误: {e}")
         return ""
 
     cleaned_text = _clean_text(text_content)
-    slice_size = slice_size_kb * 1024
-    if len(cleaned_text) <= slice_size * 2:
+    total_len = len(cleaned_text)
+    part_size = 2 * 1024  # 每个部分 2KB
+
+    if total_len <= 3 * part_size:
         return cleaned_text
 
-    head = cleaned_text[:slice_size]
-    tail = cleaned_text[-slice_size:]
+    head = cleaned_text[:part_size]
 
-    return head + "\n...\n" + tail
+    middle_start = (total_len - part_size) // 2
+    middle_end = middle_start + part_size
+    middle = cleaned_text[middle_start:middle_end]
+
+    tail = cleaned_text[-part_size:]
+
+    return f"{head}\\n... (中间部分) ...\\n{middle}\\n... (结尾部分) ...\\n{tail}"

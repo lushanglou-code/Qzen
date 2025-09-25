@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-单元测试模块：测试交互式分析与搜索服务 (v3.2 修正版)。
+单元测试模块：测试交互式分析与搜索服务 (v4.3 验证版)。
 
-此测试文件已完全重写，以匹配 v3.2 版本 AnalysisService 的新架构，
-该架构现在依赖于 Orchestrator 来执行核心的相似度分析任务。
+此版本新增了一个针对 v4.3 修复的单元测试，以确保 `find_similar_to_file`
+方法始终通过稳定的数据库 ID 而非不稳定的文件路径来调用核心业务逻辑，
+从而验证了关键 Bug 的修复。
 """
 
 import os
@@ -18,7 +19,7 @@ from qzen_core.analysis_service import AnalysisService
 from qzen_data.models import Document
 
 class TestAnalysisService(unittest.TestCase):
-    """测试 AnalysisService 类的功能 (v3.2 版本)。"""
+    """测试 AnalysisService 类的功能。"""
 
     def setUp(self):
         """为每个测试用例设置模拟的依赖项。"""
@@ -59,6 +60,34 @@ class TestAnalysisService(unittest.TestCase):
 
         # 3. 验证它返回了来自 orchestrator 的结果
         self.assertEqual(results, expected_results)
+
+    def test_find_similar_correctly_uses_file_id_after_fix(self):
+        """
+        v4.3 验证: 确保 find_similar_to_file 始终使用数据库 ID 调用 Orchestrator。
+
+        此测试明确验证 v4.3 的修复：服务层将从 UI 接收到的稳定文件 ID
+        直接、正确地传递给业务逻辑层。这是解决因外部文件路径与内部
+        （中间）文件路径不匹配而导致“文件未找到”错误的核心。
+        """
+        # --- Arrange ---
+        test_file_id = 999  # 模拟一个来自UI的请求，UI只知道数据库ID
+        test_top_n = 5
+        mock_is_cancelled = lambda: False
+        
+        # --- Act ---
+        self.service.find_similar_to_file(
+            file_id=test_file_id, 
+            top_n=test_top_n,
+            is_cancelled_callback=mock_is_cancelled
+        )
+
+        # --- Assert ---
+        # 验证 AnalysisService 是否将这个 ID 原封不动地传递给了 Orchestrator
+        self.mock_orchestrator.find_top_n_similar_for_file.assert_called_once_with(
+            target_file_id=test_file_id,
+            n=test_top_n,
+            is_cancelled_callback=mock_is_cancelled
+        )
 
     @patch('qzen_core.analysis_service.shutil')
     @patch('qzen_core.analysis_service.os')

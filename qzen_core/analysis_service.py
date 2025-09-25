@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-交互式分析与搜索服务模块 (v3.2 - 新增相似文件分析)。
+交互式分析与搜索服务模块 (v4.3 - 修复相似文件查找调用)。
 
-此版本为相似文件查找返回了完整的结果（包括分数），并重构了
-文件导出逻辑，以支持新功能。
+此版本修正了 `find_similar_to_file` 方法，以匹配 v4.3 版本
+`Orchestrator` 中 `find_top_n_similar_for_file` 方法的新接口，
+确保了基于数据库文档 ID 的稳定调用链路。
 """
 
 import logging
@@ -35,7 +36,7 @@ class AnalysisService:
     def find_similar_to_file(self, file_id: int, top_n: int = 10, progress_callback: Callable = _noop_callback, is_cancelled_callback: Callable[[], bool] = lambda: False) -> List[Dict[str, Any]]:
         """
         查找与指定文件内容最相似的前 N 个其他文件。
-        v3.2 修正: 直接调用 Orchestrator 的方法，并返回包含分数的完整结果。
+        v4.3 修正: 调用 Orchestrator v4.3 版本的同名方法，使用 file_id。
         """
         logging.info(f"收到为文件 ID {file_id} 查找 {top_n} 个相似文件的请求。")
         
