@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-单元测试模块：测试业务流程协调器 Orchestrator (v4.3 验证版)。
+单元测试模块：测试业务流程协调器 Orchestrator (v5.4)。
 
-此版本新增了一个关键测试用例 (`test_deduplication_flattens_and_renames_on_conflict`)
-来取代旧的测试，以精确验证 v4.3 版本中实现的“扁平化、去重与重命名”的
-数据摄取新策略，确保其严格符合架构设计。
+此测试套件通过模拟 (Mocking) 外部依赖，专注于验证 Orchestrator 的核心业务逻辑，
+包括数据摄取流程中的“扁平化、去重与重命名”策略，以及与各个服务之间的交互是否正确。
 """
 
 import os
@@ -39,7 +38,7 @@ class TestOrchestrator(unittest.TestCase):
     @patch('qzen_core.orchestrator.os')
     def test_deduplication_flattens_and_renames_on_conflict(self, mock_os, mock_shutil, mock_file_handler):
         """
-        v4.3 验证: 测试 run_deduplication_core 是否正确地实现了“扁平化、去重与重命名”策略。
+        验证: run_deduplication_core 是否正确地实现了“扁平化、去重与重命名”策略。
         """
         # --- Arrange ---
         source_path = "/source"
@@ -67,16 +66,12 @@ class TestOrchestrator(unittest.TestCase):
         mock_file_handler.calculate_content_hash.side_effect = get_hash_side_effect
 
         # 3. 模拟 os 行为以触发重命名
-        # 路径拼接和拆分使用真实函数
         mock_os.path.join.side_effect = os.path.join
         mock_os.path.basename.side_effect = os.path.basename
         mock_os.path.splitext.side_effect = os.path.splitext
         mock_os.path.split.side_effect = os.path.split
 
         # 关键：模拟 os.path.exists 来触发重命名逻辑
-        # 第一次检查 report.txt -> 不存在 (False)
-        # 第二次检查 report.txt -> 存在 (True)
-        # 第三次检查 report_dup1.txt -> 不存在 (False)
         mock_os.path.exists.side_effect = [False, True, False]
 
         # 4. 模拟数据库任务创建
@@ -89,25 +84,22 @@ class TestOrchestrator(unittest.TestCase):
 
         # --- Assert ---
         # 1. 断言内容去重：只处理了两个唯一内容的文件
-        self.assertEqual(len(results), 1) # 一个文件被识别为内容重复
+        self.assertEqual(len(results), 1)
         self.assertEqual(results[0].duplicate_file_path, file3_duplicate_content_path)
 
         # 2. 断言扁平化与重命名：shutil.copy2 被调用了两次，且第二次的目标路径被重命名
         self.assertEqual(mock_shutil.copy2.call_count, 2)
         expected_copy_calls = [
-            # 第一次复制，使用原始文件名
             call(file1_original_path, os.path.join(intermediate_path, "report.txt")),
-            # 第二次复制，因为文件名冲突，重命名为 _dup1
             call(file2_original_path, os.path.join(intermediate_path, "report_dup1.txt"))
         ]
-        mock_shutil.copy2.assert_has_calls(expected_copy_calls, any_order=False) # 顺序很重要
+        mock_shutil.copy2.assert_has_calls(expected_copy_calls, any_order=False)
 
         # 3. 断言数据库记录的正确性：存入数据库的路径是经过重命名后的权威路径
         self.mock_db_handler.bulk_insert_documents.assert_called_once()
         docs_to_save = self.mock_db_handler.bulk_insert_documents.call_args[0][0]
         self.assertEqual(len(docs_to_save), 2)
 
-        # 提取保存到数据库的路径，并验证
         saved_paths = {doc.file_path for doc in docs_to_save}
         expected_paths_in_db = {
             os.path.join(intermediate_path, "report.txt").replace('\\', '/'),

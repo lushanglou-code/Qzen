@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.abspath('..'))
 project = 'Qzen'
 copyright = '2025, LuZhao'
 author = 'LuZhao'
-release = 'y'
+release = '5.4'
 
 graphviz_dot_args = [
     '-Gcharset=utf8'  # <-- 强制 Graphviz 使用 UTF-8 编码处理文本 # #

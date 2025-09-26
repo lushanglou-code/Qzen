@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-单元测试模块：测试交互式分析与搜索服务 (v4.3 验证版)。
+单元测试模块：测试交互式分析与搜索服务 (v5.4)。
 
-此版本新增了一个针对 v4.3 修复的单元测试，以确保 `find_similar_to_file`
-方法始终通过稳定的数据库 ID 而非不稳定的文件路径来调用核心业务逻辑，
-从而验证了关键 Bug 的修复。
+此测试套件通过模拟 (Mocking) 数据库处理器和业务流程协调器，
+专注于验证 AnalysisService 是否能正确地将用户请求代理到相应的后端服务，
+以及是否能正确处理文件导出等交互逻辑。
 """
 
 import os
@@ -37,7 +37,6 @@ class TestAnalysisService(unittest.TestCase):
         mock_is_cancelled = lambda: False
         expected_results = [{'id': 4, 'path': '/path/to/doc4.txt', 'score': 0.99}]
 
-        # 配置模拟对象的返回值
         self.mock_orchestrator.find_top_n_similar_for_file.return_value = expected_results
 
         # --- Act ---
@@ -48,29 +47,20 @@ class TestAnalysisService(unittest.TestCase):
         )
 
         # --- Assert ---
-        # 1. 验证它首先尝试预热引擎
         self.mock_orchestrator.prime_similarity_engine.assert_called_once_with(is_cancelled_callback=mock_is_cancelled)
-        
-        # 2. 验证它随后调用了 orchestrator 的核心方法，并传递了正确的参数
         self.mock_orchestrator.find_top_n_similar_for_file.assert_called_once_with(
             target_file_id=test_file_id, 
             n=test_top_n, 
             is_cancelled_callback=mock_is_cancelled
         )
-
-        # 3. 验证它返回了来自 orchestrator 的结果
         self.assertEqual(results, expected_results)
 
-    def test_find_similar_correctly_uses_file_id_after_fix(self):
+    def test_find_similar_correctly_uses_file_id(self):
         """
-        v4.3 验证: 确保 find_similar_to_file 始终使用数据库 ID 调用 Orchestrator。
-
-        此测试明确验证 v4.3 的修复：服务层将从 UI 接收到的稳定文件 ID
-        直接、正确地传递给业务逻辑层。这是解决因外部文件路径与内部
-        （中间）文件路径不匹配而导致“文件未找到”错误的核心。
+        验证: 确保 find_similar_to_file 始终使用数据库 ID 调用 Orchestrator。
         """
         # --- Arrange ---
-        test_file_id = 999  # 模拟一个来自UI的请求，UI只知道数据库ID
+        test_file_id = 999
         test_top_n = 5
         mock_is_cancelled = lambda: False
         
@@ -82,7 +72,6 @@ class TestAnalysisService(unittest.TestCase):
         )
 
         # --- Assert ---
-        # 验证 AnalysisService 是否将这个 ID 原封不动地传递给了 Orchestrator
         self.mock_orchestrator.find_top_n_similar_for_file.assert_called_once_with(
             target_file_id=test_file_id,
             n=test_top_n,
@@ -111,21 +100,14 @@ class TestAnalysisService(unittest.TestCase):
         result_path = self.service.export_files_by_ids(doc_ids_to_export, destination_dir)
 
         # --- Assert ---
-        # 1. 验证它创建了目标目录
         mock_os.makedirs.assert_called_once_with(destination_dir, exist_ok=True)
-
-        # 2. 验证它从数据库获取了正确的文档信息
         self.mock_db_handler.get_documents_by_ids.assert_called_once_with(doc_ids_to_export)
-
-        # 3. 验证它为每个文件调用了复制操作
         expected_calls = [
             call("/path/to/doc1.txt", os.path.join(destination_dir, "doc1.txt")),
             call("/path/to/doc3.docx", os.path.join(destination_dir, "doc3.docx")),
         ]
         mock_shutil.copy2.assert_has_calls(expected_calls, any_order=True)
         self.assertEqual(mock_shutil.copy2.call_count, 2)
-
-        # 4. 验证它返回了目标目录的路径
         self.assertEqual(result_path, destination_dir)
 
     @patch('qzen_core.analysis_service.AnalysisService.export_files_by_ids')
@@ -139,7 +121,6 @@ class TestAnalysisService(unittest.TestCase):
         keyword = "test keyword"
         base_dir = "/base/export"
         
-        # 模拟 os.path.join 和 os.path.normpath 的行为
         mock_os.path.join.side_effect = os.path.join
         mock_os.path.normpath.side_effect = os.path.normpath
         
@@ -151,7 +132,6 @@ class TestAnalysisService(unittest.TestCase):
         self.service.export_search_results(doc_ids, keyword, base_dir, mock_progress, mock_is_cancelled)
 
         # --- Assert ---
-        # 验证核心委托：调用了通用的 export_files_by_ids 方法，并传递了正确构造的路径
         mock_export_files.assert_called_once_with(
             doc_ids, 
             expected_export_dir, 

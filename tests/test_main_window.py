@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Qzen 主窗口的UI冒烟测试 (v3.2 修正版)。
+Qzen 主窗口的UI冒烟测试 (v5.4)。
 
 这些测试旨在确保主窗口能够成功地实例化并集成所有模块化的UI标签页，
-并且每个标签页内部的核心控件都已创建。此版本已更新以匹配 v3.2 的 UI 变更。
+并且每个标签页内部的核心控件都已创建。此版本已更新以匹配 v5.x 的 UI 变更。
 """
 
 import pytest
@@ -26,12 +26,12 @@ def test_main_window_creation(app: MainWindow):
     测试: 主窗口是否能被成功创建。
     """
     assert isinstance(app, QMainWindow)
-    # v3.2 修正: 更新版本号以匹配当前的窗口标题
-    assert "Qzen (千针) v3.2" in app.windowTitle()
+    # v5.4 修复: 更新版本号以匹配当前的窗口标题
+    assert "Qzen (千针) v5.1" in app.windowTitle()
 
 def test_tabs_are_created_and_named_correctly(app: MainWindow):
     """
-    测试 (v2.0): 所有标签页是否都已创建并使用新的名称。
+    测试: 所有标签页是否都已创建并正确命名。
     """
     assert app.tabs is not None
     assert app.tabs.count() == 4
@@ -42,7 +42,7 @@ def test_tabs_are_created_and_named_correctly(app: MainWindow):
 
 def test_tab_instances_are_created(app: MainWindow):
     """
-    测试 (v2.0): MainWindow 是否持有所有模块化 Tab 的实例。
+    测试: MainWindow 是否持有所有模块化 Tab 的实例。
     """
     assert app.setup_tab is not None
     assert app.processing_tab is not None
@@ -51,7 +51,7 @@ def test_tab_instances_are_created(app: MainWindow):
 
 def test_setup_tab_widgets_exist(app: MainWindow):
     """
-    测试 (v2.0): “配置”标签页中的所有控件是否都已创建。
+    测试: “配置”标签页中的所有控件是否都已创建。
     """
     tab = app.setup_tab
     assert tab.db_config_button is not None
@@ -63,7 +63,7 @@ def test_setup_tab_widgets_exist(app: MainWindow):
 
 def test_processing_tab_widgets_exist(app: MainWindow):
     """
-    测试 (v2.0): “数据摄取”标签页中的控件是否都已创建。
+    测试: “数据摄取”标签页中的控件是否都已创建。
     """
     tab = app.processing_tab
     assert tab.ingestion_button is not None
@@ -71,34 +71,34 @@ def test_processing_tab_widgets_exist(app: MainWindow):
 
 def test_analysis_cluster_tab_widgets_exist(app: MainWindow):
     """
-    测试 (v3.2): “分析与聚类”标签页中的控件是否都已创建。
+    测试: “分析与聚类”标签页中的控件是否都已创建。
     """
     tab = app.analysis_cluster_tab
-    # v3.2 修正: 检查 v3.2 中实际存在的控件
     assert tab.cluster_target_dir_line_edit is not None
     assert tab.k_spinbox is not None
     assert tab.similarity_threshold_spinbox is not None
-    assert tab.run_clustering_button is not None
+    # v5.4 修复: 检查重构后的 K-Means 和相似度分组按钮
+    assert tab.run_kmeans_button is not None
+    assert tab.run_similarity_button is not None
     assert tab.source_file_line_edit is not None
     assert tab.find_similar_button is not None
     assert tab.similar_results_table is not None
 
 def test_keyword_search_tab_widgets_exist(app: MainWindow):
     """
-    测试 (v3.1): “关键词搜索”标签页中的控件是否都已创建。
+    测试: “关键词搜索”标签页中的控件是否都已创建。
     """
     tab = app.keyword_search_tab
     assert tab.keyword_input is not None
     assert tab.filename_search_button is not None
     assert tab.content_search_button is not None
-    # v3.1 修正: 检查 QTableWidget 和新增的复选框
     assert tab.results_table is not None
     assert tab.select_all_checkbox is not None
     assert tab.export_button is not None
 
 def test_status_bar_widgets_exist(app: MainWindow):
     """
-    测试 (v2.0): 底部状态栏的控件是否都已创建。
+    测试: 底部状态栏的控件是否都已创建。
     """
     assert app.progress_bar is not None
     assert app.cancel_button is not None

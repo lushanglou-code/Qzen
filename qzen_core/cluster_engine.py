@@ -1,16 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-聚类引擎模块 (v5.3.2 - 终极数据一致性修复)。
+聚类引擎模块 (v5.4.1 - 健壮性修复)。
 
-此版本包含一个关键修复：
-1.  在 `_move_files_to_cluster_dir` 方法中，确保了每一次 `shutil.move`
-    成功后，都立即、无条件地更新数据库中对应记录的 `file_path` 字段。
-    此版本通过为每一次文件移动操作创建一个全新的、独立的数据库会话，
-    并在该会话中使用 `session.get()` 来重新获取并更新文档对象，
-    最终实现了绝对的原子化操作。
+此版本修复了 `_cleanup_empty_folders` 方法中的一个逻辑缺陷。
+原先的实现依赖于 `os.walk` 的静态 `dirnames` 和 `filenames` 列表，
+这在子目录被删除后无法正确判断父目录是否变为空。
 
-这彻底解决了因文件移动后数据库状态未同步，而导致后续操作出现“文件未找到”
-的严重数据一致性 Bug。
+新实现改用 `os.listdir()` 在循环内部进行实时检查，确保了空目录
+删除的准确性和健壮性。
 """
 import logging
 import os
@@ -115,7 +112,6 @@ class ClusterEngine:
                     shutil.move(source_path, final_destination_path)
                     moved_count += 1
 
-                    # v5.3.2 终极修复: 放弃 merge，改用更明确的 get -> update -> commit 模式
                     with self.db_handler.get_session() as session:
                         doc_to_update = session.get(Document, doc.id)
                         if doc_to_update:
@@ -141,8 +137,9 @@ class ClusterEngine:
         """
         logging.info(f"开始清理目录 '{directory}' 下的空文件夹...")
         deleted_count = 0
-        for dirpath, dirnames, filenames in os.walk(directory, topdown=False):
-            if not dirnames and not filenames:
+        for dirpath, _, _ in os.walk(directory, topdown=False):
+            # v5.4.1 修复: 不依赖 os.walk 的静态列表，改用 os.listdir 进行实时检查
+            if not os.listdir(dirpath):
                 try:
                     os.rmdir(dirpath)
                     logging.info(f"  - 已删除空文件夹: {dirpath}")
@@ -239,23 +236,33 @@ class ClusterEngine:
                 for idx in current_cluster_indices:
                     visited[idx] = True
 
-        if not clusters:
+        # --- 移动相似文件簇 ---
+        if clusters:
+            total_moved = 0
+            for i, cluster_indices in enumerate(clusters):
+                if is_cancelled_callback(): return False
+
+                doc_ids = [dir_doc_map[idx]['id'] for idx in cluster_indices]
+                docs_to_move = self.db_handler.get_documents_by_ids(doc_ids)
+
+                top_keywords = self._get_top_keywords(cluster_indices)
+                cluster_name = f"相似文件簇/{i:02d}_{top_keywords}"
+
+                total_moved += self._move_files_to_cluster_dir(docs_to_move, target_dir, cluster_name, progress_callback,
+                                                               is_cancelled_callback)
+            logging.info(f"相似度分组完成。共找到 {total_moved} 个文件被归入新簇。")
+        else:
             logging.info("在给定的阈值下，未发现任何可以归为一类的相似文件。")
-            return True
 
-        total_moved = 0
-        for i, cluster_indices in enumerate(clusters):
+        # --- v5.4 新增: 移动所有未成簇的独立文件到 'alone' 文件夹 ---
+        alone_doc_indices = [i for i, is_visited in enumerate(visited) if not is_visited]
+        if alone_doc_indices:
             if is_cancelled_callback(): return False
-
-            doc_ids = [dir_doc_map[idx]['id'] for idx in cluster_indices]
-            docs_to_move = self.db_handler.get_documents_by_ids(doc_ids)
-
-            top_keywords = self._get_top_keywords(cluster_indices)
-            cluster_name = f"相似文件簇/{i:02d}_{top_keywords}"
-
-            total_moved += self._move_files_to_cluster_dir(docs_to_move, target_dir, cluster_name, progress_callback,
-                                                           is_cancelled_callback)
+            logging.info(f"找到 {len(alone_doc_indices)} 个未成簇的独立文件，将它们移动到 'alone' 文件夹。")
+            alone_doc_ids = [dir_doc_map[idx]['id'] for idx in alone_doc_indices]
+            docs_to_move_alone = self.db_handler.get_documents_by_ids(alone_doc_ids)
+            self._move_files_to_cluster_dir(docs_to_move_alone, target_dir, "alone", progress_callback, is_cancelled_callback)
 
         self._cleanup_empty_folders(target_dir)
-        logging.info(f"相似度分组完成。共找到 {total_moved} 个文件被归入新簇。")
+        logging.info(f"相似度分组操作已全部完成。")
         return True

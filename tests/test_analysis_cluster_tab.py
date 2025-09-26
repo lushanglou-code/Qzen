@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-测试单元：分析与聚类标签页 (v3.2 修正版)。
+测试单元：分析与聚类标签页 (v5.4.2)。
 
-此测试验证 AnalysisClusterTab 的核心交互逻辑，确保在移除目录树后，
-通过文件夹选择对话框驱动的聚类流程能正确触发信号。
+此版本修复了信号发射测试。之前的测试直接调用了 `set_cluster_target_dir`，
+而更健壮的测试应该模拟用户的完整交互。新的测试通过模拟 QFileDialog 
+和按钮点击，来确保从选择文件夹到执行聚类的整个流程都能正确触发信号。
 """
 
+import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -25,66 +27,82 @@ class TestAnalysisClusterTab(unittest.TestCase):
         """在每个测试方法运行前，创建一个新的标签页实例。"""
         self.tab = AnalysisClusterTab()
 
-    def test_run_clustering_signal_emitted_with_correct_data(self):
+    @patch('PyQt6.QtWidgets.QFileDialog.getExistingDirectory')
+    def test_run_kmeans_signal_emitted_correctly(self, mock_get_dir):
         """
-        测试核心功能：当用户设置了目标目录并点击“运行聚类”时，
-        是否能以正确的参数发射 run_clustering_clicked 信号。
+        测试: 模拟用户选择文件夹、设置参数并点击 K-Means 按钮的完整流程。
         """
-        # 1. 模拟用户设置的目标目录、K值和阈值
+        # 1. 模拟用户选择文件夹
         test_directory = "/path/to/test/dir"
-        test_k = 7
-        test_threshold = 0.9
+        mock_get_dir.return_value = test_directory
+        self.tab.select_cluster_target_dir_button.click()
 
-        # v3.2 修正: 调用更新后的方法名
-        self.tab.set_cluster_target_dir(test_directory)
+        # 2. 模拟用户设置 K 值
+        test_k = 7
         self.tab.k_spinbox.setValue(test_k)
+
+        # 3. 连接信号到 spy
+        spy_slot = Mock()
+        self.tab.run_kmeans_clicked.connect(spy_slot)
+
+        # 4. 模拟用户点击按钮
+        self.tab.run_kmeans_button.click()
+
+        # 5. 断言信号被正确发射
+        expected_path = os.path.normpath(test_directory)
+        spy_slot.assert_called_once_with(expected_path, test_k)
+
+    @patch('PyQt6.QtWidgets.QFileDialog.getExistingDirectory')
+    def test_run_similarity_signal_emitted_correctly(self, mock_get_dir):
+        """
+        测试: 模拟用户选择文件夹、设置参数并点击相似度分组按钮的完整流程。
+        """
+        test_directory = "/path/to/test/dir"
+        mock_get_dir.return_value = test_directory
+        self.tab.select_cluster_target_dir_button.click()
+
+        test_threshold = 0.9
         self.tab.similarity_threshold_spinbox.setValue(test_threshold)
 
-        # 2. 创建一个“间谍”函数来监听信号
         spy_slot = Mock()
-        self.tab.run_clustering_clicked.connect(spy_slot)
+        self.tab.run_similarity_clicked.connect(spy_slot)
 
-        # 3. 模拟用户点击“运行聚类”按钮
-        self.tab.run_clustering_button.click()
+        self.tab.run_similarity_button.click()
 
-        # 4. 断言：“间谍”函数被调用了一次，并且接收到的参数与我们设置的完全一致
-        spy_slot.assert_called_once_with(test_directory, test_k, test_threshold)
+        expected_path = os.path.normpath(test_directory)
+        spy_slot.assert_called_once_with(expected_path, test_threshold)
 
-    def test_run_clustering_signal_not_emitted_if_dir_is_empty(self):
+    def test_signals_not_emitted_if_dir_is_empty(self):
         """
-        测试边界条件：如果目标目录为空，则不应发射信号。
+        测试边界条件：如果目标目录为空，则点击任一聚类按钮都不应发射信号。
         """
-        # 1. 确保目标目录为空
-        # v3.2 修正: 调用更新后的方法名
         self.tab.set_cluster_target_dir("")
 
-        # 2. 创建一个“间谍”函数
-        spy_slot = Mock()
-        self.tab.run_clustering_clicked.connect(spy_slot)
+        kmeans_spy = Mock()
+        similarity_spy = Mock()
+        self.tab.run_kmeans_clicked.connect(kmeans_spy)
+        self.tab.run_similarity_clicked.connect(similarity_spy)
 
-        # 3. 模拟点击
-        self.tab.run_clustering_button.click()
+        self.tab.run_kmeans_button.click()
+        self.tab.run_similarity_button.click()
 
-        # 4. 断言：“间谍”函数从未被调用
-        spy_slot.assert_not_called()
+        kmeans_spy.assert_not_called()
+        similarity_spy.assert_not_called()
 
     @patch('PyQt6.QtWidgets.QFileDialog.getExistingDirectory')
     def test_select_directory_button_updates_path(self, mock_get_dir):
         """
-        测试文件夹选择按钮是否能正确更新 UI 上的路径。
+        测试文件夹选择按钮是否能正确更新 UI 上的路径，并处理路径规范化。
         """
-        # 1. 配置模拟的 QFileDialog，使其“返回”一个指定的路径
         test_path = "/selected/from/dialog"
         mock_get_dir.return_value = test_path
+        
+        expected_path = os.path.normpath(test_path)
 
-        # 2. 模拟用户点击“选择文件夹”按钮
-        # v3.2 修正: 调用更新后的按钮名
         self.tab.select_cluster_target_dir_button.click()
 
-        # 3. 断言：QLineEdit 中的文本已被更新为对话框返回的路径
-        # v3.2 修正: 检查更新后的控件和属性名
-        self.assertEqual(self.tab.cluster_target_dir_line_edit.text(), test_path)
-        self.assertEqual(self.tab.cluster_target_dir, test_path)
+        self.assertEqual(self.tab.cluster_target_dir_line_edit.text(), expected_path)
+        self.assertEqual(self.tab.cluster_target_dir, expected_path)
 
 if __name__ == '__main__':
     unittest.main()
