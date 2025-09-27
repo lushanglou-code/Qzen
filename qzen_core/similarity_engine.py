@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-相似度计算引擎模块 (v4.2.6 - 修复关键词提取方法)。
+相似度计算引擎模块 (v4.3.0 - 优化向量化器配置)。
 
-此版本将 `get_top_keywords_for_docs` 重命名为 `get_top_keywords`，
-以修复在 `cluster_engine` 中因方法名不匹配而导致的 `AttributeError`。
+此版本修复了 `TfidfVectorizer` 初始化时产生的 `UserWarning`。
+通过在自定义分词器 `_tokenizer` 中统一处理停用词，并从 `TfidfVectorizer`
+的参数中移除 `stop_words`，解决了停用词处理不一致的警告，确保了
+停用词逻辑的唯一性和清晰性。
 """
 
 import logging
@@ -34,10 +36,11 @@ class SimilarityEngine:
         """
         self.max_features = max_features
         self.stopwords = self._load_stopwords(custom_stopwords)
+        # v4.3.0 修复: 移除 stop_words 参数，因为 _tokenizer 已处理停用词，
+        # 这可以解决 'Your stop_words may be inconsistent' 的 UserWarning。
         self.vectorizer = TfidfVectorizer(
             max_features=self.max_features,
-            tokenizer=self._tokenizer,
-            stop_words=list(self.stopwords)
+            tokenizer=self._tokenizer
         )
         self.feature_matrix = None
         self.doc_map = []
@@ -52,15 +55,18 @@ class SimilarityEngine:
     def update_stopwords(self, custom_stopwords: List[str]):
         """动态更新停用词列表并重建向量化器。"""
         self.stopwords = self._load_stopwords(custom_stopwords)
+        # v4.3.0 修复: 同样在此处移除 stop_words 参数
         self.vectorizer = TfidfVectorizer(
             max_features=self.max_features,
-            tokenizer=self._tokenizer,
-            stop_words=list(self.stopwords)
+            tokenizer=self._tokenizer
         )
         logging.info("SimilarityEngine 已接收新的停用词并重建了 TF-IDF 向量化器。")
 
     def _tokenizer(self, text: str) -> List[str]:
-        """自定义分词器。"""
+        """
+        自定义分词器，使用 jieba 分词并过滤停用词。
+        """
+        # 在分词时直接过滤停用词和空字符串
         return [word for word in jieba.cut(text) if word.strip() and word not in self.stopwords]
 
     def vectorize_documents(self, documents: List[str]):

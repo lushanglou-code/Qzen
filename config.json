@@ -1,9 +1,9 @@
 {
-    "source_dir": "E:\\workfortest\\testfile\\解决方案\\oracle迁移",
+    "source_dir": "E:\\workfortest\\testfile",
     "intermediate_dir": "E:\\workfortest\\oldfile",
     "target_dir": "E:\\workfortest\\newfile",
     "max_features": 7000,
     "custom_stopwords": "达梦\nDM\n数据库\n管理\n系统\n数据\n应用\n数字",
     "last_keyword": "迁移",
-    "similarity_threshold": 0.5
+    "similarity_threshold": 0.7500000000000002
 }

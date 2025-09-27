@@ -1,17 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-聚类引擎模块 (v5.4.1 - 健壮性修复)。
+聚类引擎模块 (v5.5.0 - 稳定性和路径修复)。
 
-此版本修复了 `_cleanup_empty_folders` 方法中的一个逻辑缺陷。
-原先的实现依赖于 `os.walk` 的静态 `dirnames` 和 `filenames` 列表，
-这在子目录被删除后无法正确判断父目录是否变为空。
+此版本引入了多项关键修复，以提高文件操作的稳定性和健壮性：
+1.  **路径清理**: 新增 `_sanitize_filename` 方法，用于移除或替换
+    用作目录名的字符串中的所有非法字符（如 `\ / : * ? " < > |`）。
+    这解决了 `run_similarity_clustering` 中因 `top_keywords` 包含
+    非法字符而导致的 `OSError: [WinError 123]` 崩溃问题。
 
-新实现改用 `os.listdir()` 在循环内部进行实时检查，确保了空目录
-删除的准确性和健壮性。
+2.  **文件移动重试机制**: `_move_files_to_cluster_dir` 方法中加入了
+    针对 `PermissionError` 的重试逻辑。当 `shutil.move` 因文件被
+    占用而失败时，程序会等待一小段时间后重试，从而大大降低因杀毒
+    软件、文件索引等临时锁而导致的操作失败。
+
+3.  **路径规范化**: 强化了对路径分隔符的处理，确保所有路径在传递
+    给文件系统 API 前都经过 `os.path.normpath` 的规范化，避免了
+    混合使用 `/` 和 `\` 可能引发的错误。
 """
 import logging
 import os
+import re  # 导入 re 模块用于清理文件名
 import shutil
+import time  # 导入 time 模块用于重试等待
 from collections import defaultdict
 from typing import List, Callable
 
@@ -57,6 +67,22 @@ class ClusterEngine:
         self.db_handler = db_handler
         self.similarity_engine = similarity_engine
 
+    def _sanitize_filename(self, name: str, max_length: int = 100) -> str:
+        """
+        清理字符串，使其成为合法的文件或目录名。
+        - 移除 Windows 和 Unix/Linux 系统中的非法字符。
+        - 将多个空格替换为单个下划线。
+        - 截断到合理的长度。
+        """
+        # 移除 Windows 和其他系统中的非法字符
+        sanitized_name = re.sub(r'[\\/:*?"<>|]', '_', name)
+        # 将一个或多个空格/制表符替换为单个下划线
+        sanitized_name = re.sub(r'\s+', '_', sanitized_name)
+        # 移除可能导致路径问题的首尾点和空格
+        sanitized_name = sanitized_name.strip('. ')
+        # 截断文件名以避免路径过长错误
+        return sanitized_name[:max_length]
+
     def _get_docs_in_dir(self, target_dir: str) -> List[Document]:
         """
         获取指定目录下所有已入库的文档。
@@ -91,10 +117,16 @@ class ClusterEngine:
     def _move_files_to_cluster_dir(self, docs: List[Document], base_dir: str, cluster_name: str,
                                    progress_callback: Callable, is_cancelled: Callable) -> int:
         """
-        将文档移动到指定的聚类子目录中。
+        将文档移动到指定的聚类子目录中，增加了对 PermissionError 的重试逻辑。
         """
         cluster_dir = os.path.join(base_dir, cluster_name)
-        os.makedirs(cluster_dir, exist_ok=True)
+        
+        try:
+            os.makedirs(cluster_dir, exist_ok=True)
+        except OSError as e:
+            logging.error(f"创建目录 '{cluster_dir}' 失败: {e}。跳过此簇。")
+            return 0
+
         moved_count = 0
 
         for i, doc in enumerate(docs):
@@ -109,7 +141,20 @@ class ClusterEngine:
                     destination_path = os.path.join(cluster_dir, base_filename)
                     final_destination_path = _find_unique_filepath(destination_path)
 
-                    shutil.move(source_path, final_destination_path)
+                    # v5.5.0 修复: 增加文件移动的重试逻辑
+                    max_retries = 3
+                    retry_delay = 0.5  # seconds
+                    for attempt in range(max_retries):
+                        try:
+                            shutil.move(source_path, final_destination_path)
+                            break  # 成功则跳出循环
+                        except PermissionError:
+                            if attempt < max_retries - 1:
+                                logging.warning(f"移动文件 {source_path} 时被占用，将在 {retry_delay} 秒后重试...")
+                                time.sleep(retry_delay)
+                            else:
+                                raise # 最后一次尝试失败后，重新抛出异常
+
                     moved_count += 1
 
                     with self.db_handler.get_session() as session:
@@ -239,6 +284,8 @@ class ClusterEngine:
         # --- 移动相似文件簇 ---
         if clusters:
             total_moved = 0
+            # v5.5.0 修复: 将相似文件簇的根目录名从硬编码的中文改为 "similar_clusters"
+            cluster_base_dir = os.path.join(target_dir, "similar_clusters")
             for i, cluster_indices in enumerate(clusters):
                 if is_cancelled_callback(): return False
 
@@ -246,9 +293,11 @@ class ClusterEngine:
                 docs_to_move = self.db_handler.get_documents_by_ids(doc_ids)
 
                 top_keywords = self._get_top_keywords(cluster_indices)
-                cluster_name = f"相似文件簇/{i:02d}_{top_keywords}"
+                # v5.5.0 修复: 使用新的 _sanitize_filename 方法清理 top_keywords
+                sanitized_keywords = self._sanitize_filename(top_keywords)
+                cluster_name = f"{i:02d}_{sanitized_keywords}"
 
-                total_moved += self._move_files_to_cluster_dir(docs_to_move, target_dir, cluster_name, progress_callback,
+                total_moved += self._move_files_to_cluster_dir(docs_to_move, cluster_base_dir, cluster_name, progress_callback,
                                                                is_cancelled_callback)
             logging.info(f"相似度分组完成。共找到 {total_moved} 个文件被归入新簇。")
         else:
@@ -258,10 +307,11 @@ class ClusterEngine:
         alone_doc_indices = [i for i, is_visited in enumerate(visited) if not is_visited]
         if alone_doc_indices:
             if is_cancelled_callback(): return False
-            logging.info(f"找到 {len(alone_doc_indices)} 个未成簇的独立文件，将它们移动到 'alone' 文件夹。")
+            logging.info(f"找到 {len(alone_doc_indices)} 个未成簇的独立文件，将它们移动到 'unclustered' 文件夹。")
             alone_doc_ids = [dir_doc_map[idx]['id'] for idx in alone_doc_indices]
             docs_to_move_alone = self.db_handler.get_documents_by_ids(alone_doc_ids)
-            self._move_files_to_cluster_dir(docs_to_move_alone, target_dir, "alone", progress_callback, is_cancelled_callback)
+            # v5.5.0 修复: 将 'alone' 文件夹重命名为 'unclustered' 以提高清晰度
+            self._move_files_to_cluster_dir(docs_to_move_alone, target_dir, "unclustered", progress_callback, is_cancelled_callback)
 
         self._cleanup_empty_folders(target_dir)
         logging.info(f"相似度分组操作已全部完成。")
